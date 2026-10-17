@@ -17,7 +17,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-VERSION='1.4'
+VERSION='1.5'
 MODE='audit'
 FORCE_SSH_KEEP=true          # set to false if you really want to remove SSH from public zone
 AGGRESSIVE_USERNS=false      # set to true to disable unprivileged user namespaces (breaks Flatpak/Podman rootless)
@@ -166,7 +166,7 @@ elif [[ $MODE == apply ]]; then
   if ask_yn "3. Build and deploy Hardened Malloc?" "n"; then INSTALL_HARDENED_MALLOC=true; fi
   if ask_yn "4. Lockdown user profile files (.bashrc, etc. -> root ownership)?" "n"; then LOCKDOWN_BASHRC=true; fi
   if ask_yn "5. Configure a separate superior admin user for run0/privileges?" "n"; then SETUP_SUPERIOR_USER=true; fi
-  if ask_yn "6. Setup layout panel?" "n"; then SETUP_GNOME_LAYOUT=true; fi
+  if ask_yn "6. Setup GNOME layout, extensions, icons/cursors & tiling?" "n"; then SETUP_GNOME_LAYOUT=true; fi
 fi
 
 # ===========================================================================
@@ -194,8 +194,6 @@ KARGS_EXTRA=(
   spec_store_bypass_disable=on
   l1d_flush=on
   gather_data_sampling=force
-  #module.sig_enforce=1
-  #lockdown=confidentiality
 )
 
 if command -v grubby &>/dev/null; then
@@ -668,7 +666,6 @@ if command -v getenforce &>/dev/null; then
 
   selinux_booleans=(
     "deny_ptrace=1"
-    #"secure_mode_insmod=1"
   )
   for bool_setting in "${selinux_booleans[@]}" ; do
     b_name="${bool_setting%%=*}"
@@ -832,7 +829,6 @@ fi
 # ===========================================================================
 section '16. Optional GNOME Bloatware Removal'
 
-# Исключён gnome-software во избежание удаления dnf5 / PackageKit
 gnome_bloat_pkgs=(
   gnome-tour
   gnome-weather
@@ -904,6 +900,8 @@ dnf_apps=(
   mediainfo
   cryptsetup
   easyeffects
+  gnome-tweaks
+  gnome-extensions-app
 )
 declare -A flatpak_apps=(
   [flatseal]="com.github.tchx84.Flatseal"
@@ -913,6 +911,7 @@ declare -A flatpak_apps=(
   [telegram]="org.telegram.desktop"
   [gimp]="org.gimp.GIMP"
   [qbittorrent]="org.qbittorrent.qBittorrent"
+  [sublimetext]="com.sublimehq.SublimeText"
 )
 
 if [[ $INSTALL_OPTIONAL_SOFTWARE == true ]]; then
@@ -973,7 +972,6 @@ if [[ $INSTALL_OPTIONAL_SOFTWARE == true ]]; then
     fi
   done
 
-  # Setup Easy Effects autostart if installed via DNF
   if [[ $MODE == apply ]] && rpm -q easyeffects &>/dev/null; then
     _target_user="${SUDO_USER:-$(logname 2>/dev/null || whoami)}"
     if [[ "$_target_user" == "root" ]]; then
@@ -983,18 +981,24 @@ if [[ $INSTALL_OPTIONAL_SOFTWARE == true ]]; then
     if [[ -n "$_target_user" && "$_target_user" != "root" ]]; then
       sudo -u "$_target_user" bash << 'EE_EOF'
         mkdir -p ~/.config/autostart
-        cat <<EOF > ~/.config/autostart/easyeffects-service.desktop
+        # Удаляем старый «кривой» файл, если он остался
+        rm -f ~/.config/autostart/easyeffects-service.desktop
+        cat <<'EOF' > ~/.config/autostart/com.github.wwmm.easyeffects.desktop
 [Desktop Entry]
 Type=Application
-Name=EasyEffects Service
+Name=Easy Effects
+Comment=Easy Effects Service
 Exec=easyeffects --gapplication-service
+Icon=com.github.wwmm.easyeffects
+StartupNotify=false
+Terminal=false
 Hidden=false
-NoDisplay=false
+NoDisplay=true
 X-GNOME-Autostart-enabled=true
-Comment=Audio limiter, compressor and other effects for PipeWire applications
+X-GNOME-Autostart-Phase=Application
 EOF
 EE_EOF
-      fixed "Added Easy Effects (DNF) to user autostart"
+      fixed "Added Easy Effects (DNF) to user autostart (proper desktop file)"
     fi
   fi
 
@@ -1144,9 +1148,9 @@ else
 fi
 
 # ===========================================================================
-# 19. GNOME Panel & App Folders Layout
+# 19. GNOME Panel, App Folders, MacTahoe Icons/Cursors & Tiling Shell
 # ===========================================================================
-section '19. GNOME Panel & App Folders Layout'
+section '19. GNOME Panel, App Folders, MacTahoe Icons/Cursors & Tiling Shell'
 
 if [[ "$SETUP_GNOME_LAYOUT" == true ]]; then
   if [[ "$IS_DESKTOP" == true ]]; then
@@ -1164,27 +1168,86 @@ if [[ "$SETUP_GNOME_LAYOUT" == true ]]; then
       info "Configuring GNOME for user: $REAL_USER (home directory: $USER_HOME)"
 
       if [[ "$MODE" == "apply" ]]; then
-        # Install GNOME extensions: Dash to Dock & Tiling Shell
+        # Install GNOME extensions and dependencies
         info "Installing GNOME extensions (Dash to Dock, Tiling Shell)..."
-        dnf install -y python3-pip jq unzip &>/dev/null || true
+        dnf install -y python3-pip jq unzip curl git &>/dev/null || true
         
-        # Установка через утилиту gnome-extensions-cli (если доступна, либо скачивание uuid)
         sudo -u "$REAL_USER" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$USER_UID/bus" bash << 'EXT_EOF'
-          # Используем официальные UUID расширений GNOME Shell
-          # Dash to Dock: dash-to-dock@micxgx.gmail.com
-          # Tiling Shell: tilingshell@ferrarodomenico.com (или аналогичный uuid)
           pip install --user gnome-extensions-cli &>/dev/null || true
           export PATH="$HOME/.local/bin:$PATH"
           
-          # Установка Dash to dock и Tiling Shell
           gext install dash-to-dock@micxgx.gmail.com 2>/dev/null || true
           gext install tilingshell@ferrarodomenico.com 2>/dev/null || true
           
-          # Включаем установленные расширения
           gnome-extensions enable dash-to-dock@micxgx.gmail.com 2>/dev/null || true
           gnome-extensions enable tilingshell@ferrarodomenico.com 2>/dev/null || true
 EXT_EOF
         fixed "GNOME extensions (Dash to Dock, Tiling Shell) installed and enabled"
+
+        # Установка иконки и курсоров MacTahoe напрямую из исходной структуры репозитория
+        info "Downloading and installing MacTahoe icons and cursors..."
+        sudo -u "$REAL_USER" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$USER_UID/bus" bash << 'MACTAHOE_EOF'
+          set -e
+          TMP_DIR=$(mktemp -d)
+          cd "$TMP_DIR"
+
+          # Иконки
+          if curl -sL "https://github.com/vinceliuice/MacTahoe-icon-theme/archive/refs/heads/main.tar.gz" -o icon-theme.tar.gz; then
+              tar -xzf icon-theme.tar.gz
+              cd MacTahoe-icon-theme-main
+              # Устанавливаем иконки (по умолчанию в ~/.local/share/icons)
+              ./install.sh -d "$HOME/.local/share/icons" -n MacTahoe >/dev/null 2>&1 || ./install.sh >/dev/null 2>&1 || true
+
+              # Курсоры (подкаталог cursors)
+              if [[ -d cursors && -x cursors/install.sh ]]; then
+                  cd cursors
+                  ./install.sh >/dev/null 2>&1 || true
+                  cd ..
+              fi
+          fi
+          rm -rf "$TMP_DIR"
+
+          # Применяем темы
+          # Обычно после install.sh появляются MacTahoe и MacTahoe-cursors (или MacTahoe)
+          if [[ -d "$HOME/.local/share/icons/MacTahoe" ]]; then
+              gsettings set org.gnome.desktop.interface icon-theme "MacTahoe"
+          elif [[ -d "$HOME/.icons/MacTahoe" ]]; then
+              gsettings set org.gnome.desktop.interface icon-theme "MacTahoe"
+          fi
+
+          # Курсор — ищем точное имя
+          CURSOR_THEME=""
+          for cand in "MacTahoe-cursors" "MacTahoe" "MacTahoe Cursors"; do
+              if [[ -d "$HOME/.local/share/icons/$cand" || -d "$HOME/.icons/$cand" ]]; then
+                  CURSOR_THEME="$cand"
+                  break
+              fi
+          done
+          # Запасной поиск
+          if [[ -z "$CURSOR_THEME" ]]; then
+              CURSOR_THEME=$(find "$HOME/.local/share/icons" "$HOME/.icons" -maxdepth 1 -type d \( -iname "*MacTahoe*cursor*" -o -iname "*MacTahoe*" \) 2>/dev/null | head -n1 | xargs -r basename || true)
+          fi
+          if [[ -n "$CURSOR_THEME" ]]; then
+              gsettings set org.gnome.desktop.interface cursor-theme "$CURSOR_THEME"
+          fi
+MACTAHOE_EOF
+        fixed "MacTahoe icons and cursors installed and configured"
+
+        sudo -u "$REAL_USER" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$USER_UID/bus" bash << 'KB_EOF'
+  gsettings set org.gnome.desktop.input-sources xkb-options "['grp:shift_caps_toggle', 'grp:alt_shift_toggle']"
+KB_EOF
+
+        # Применение разметки для Tiling Shell (два монитора)
+        info "Applying Tiling Shell multi-monitor layout configuration..."
+        sudo -u "$REAL_USER" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$USER_UID/bus" bash << 'TILING_EOF'
+          LAYOUT_JSON='[{"id":"13321385","tiles":[{"x":0,"y":0,"width":1,"height":0.3331766917293233,"groups":[2]},{"x":0,"y":0.3331766917293233,"width":1,"height":0.3336466165413534,"groups":[2,3]},{"x":0,"y":0.6668233082706767,"width":1,"height":0.33317669172932335,"groups":[3]}]},{"id":"13564581","tiles":[{"x":0,"y":0,"width":0.5,"height":1,"groups":[1]},{"x":0.5,"y":0,"width":0.49999999999999206,"height":1,"groups":[1]}]}]'
+          
+          # Проверяем наличие схемы tlingshell и записываем разметку
+          if gsettings list-schemas | grep -q "org.gnome.shell.extensions.tilingshell"; then
+              gsettings set org.gnome.shell.extensions.tilingshell custom-layouts "$LAYOUT_JSON" 2>/dev/null || true
+          fi
+TILING_EOF
+        fixed "Tiling Shell multi-monitor layout applied successfully"
 
         # Get list of installed Flatpak applications in .desktop format
         flatpak_desktop_ids=""
@@ -1192,9 +1255,8 @@ EXT_EOF
           flatpak_desktop_ids=$(sudo -u "$REAL_USER" flatpak list --app --columns=application 2>/dev/null | awk '{print $1".desktop"}' | tr '\n' ' ')
         fi
 
-        sudo -u "$REAL_USER" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$USER_UID/bus" \
-        FLATPAK_IDS="$flatpak_desktop_ids" bash << 'GNOME_EOF'
-          # 1. Determine the correct desktop file for the terminal
+        sudo -u "$REAL_USER" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$USER_UID/bus" bash << 'GNOME_EOF'
+          # 1. Определение правильного десктоп-файла для терминала и скрытие из Show Apps
           TERMINAL_ID=""
           for term_app in "org.gnome.Terminal.desktop" "org.fedoraproject.Console.desktop" "org.gnome.Console.desktop"; do
               if [[ -f "/usr/share/applications/$term_app" ]] || [[ -f "$HOME/.local/share/applications/$term_app" ]]; then
@@ -1204,19 +1266,37 @@ EXT_EOF
           done
           [[ -z "$TERMINAL_ID" ]] && TERMINAL_ID="org.gnome.Terminal.desktop"
 
-          # Base panel applications + all installed Flatpak applications
-          base_favs=("org.gnome.Nautilus.desktop" "$TERMINAL_ID" "org.gnome.Calculator.desktop")
-          
-          for f_app in $FLATPAK_IDS; do
-              # Check if .desktop file for Flatpak exists in system or user dirs
-              if [[ -f "/var/lib/flatpak/exports/share/applications/$f_app" ]] || \
-                 [[ -f "$HOME/.local/share/flatpak/exports/share/applications/$f_app" ]] || \
-                 [[ -f "/usr/share/applications/$f_app" ]]; then
-                  base_favs+=("$f_app")
-              fi
-          done
+          # Создаем локальный override для терминала, чтобы он исчез из Show Apps, но работал на панели
+          mkdir -p "$HOME/.local/share/applications"
+          if [[ -f "/usr/share/applications/$TERMINAL_ID" ]]; then
+              cp "/usr/share/applications/$TERMINAL_ID" "$HOME/.local/share/applications/$TERMINAL_ID"
+          elif [[ -f "$HOME/.local/share/applications/$TERMINAL_ID" ]]; then
+              true
+          else
+              echo "[Desktop Entry]" > "$HOME/.local/share/applications/$TERMINAL_ID"
+              echo "Type=Application" >> "$HOME/.local/share/applications/$TERMINAL_ID"
+          fi
+          if grep -q "^NoDisplay=" "$HOME/.local/share/applications/$TERMINAL_ID"; then
+              sed -i 's/^NoDisplay=.*/NoDisplay=true/' "$HOME/.local/share/applications/$TERMINAL_ID"
+          else
+              echo "NoDisplay=true" >> "$HOME/.local/share/applications/$TERMINAL_ID"
+          fi
 
-          # Format array for gsettings (favorite-apps)
+          # 2. Строгий порядок значков на панели по вашему списку:
+          base_favs=(
+              "org.gnome.Nautilus.desktop"
+              "org.mozilla.firefox.desktop"
+              "org.telegram.desktop.desktop"
+              "org.keepassxc.KeePassXC.desktop"
+              "org.filezillaproject.Filezilla.desktop"
+              "com.sublimehq.SublimeText.desktop"
+              "org.gimp.GIMP.desktop"
+              "org.gnome.Calculator.desktop"
+              "$TERMINAL_ID"
+              "com.github.wwmm.easyeffects.desktop"
+          )
+
+          # Применяем порядок значков на панели
           fav_quoted=()
           for app in "${base_favs[@]}"; do
               fav_quoted+=("'$app'")
@@ -1224,7 +1304,7 @@ EXT_EOF
           FAV_APPS="[$(IFS=,; echo "${fav_quoted[*]}")]"
           gsettings set org.gnome.shell favorite-apps "$FAV_APPS"
 
-          # 2. Place ALL non-pinned applications into the single 'default' folder
+          # 3. Формирование папки 'Default' (все остальные приложения, кроме закрепленных выше)
           app_list=()
           while IFS= read -r desktop_file; do
               skip=false
@@ -1244,24 +1324,30 @@ EXT_EOF
           APPS_ARRAY="[${app_list[*]}]"
           unset IFS
 
-          # Configure 'default' folder with all remaining apps
           gsettings set org.gnome.desktop.app-folders.folder:/org/gnome/desktop/app-folders/folders/default/ name 'Default'
           gsettings set org.gnome.desktop.app-folders.folder:/org/gnome/desktop/app-folders/folders/default/ apps "$APPS_ARRAY"
           gsettings set org.gnome.desktop.app-folders.folder:/org/gnome/desktop/app-folders/folders/default/ categories "[]"
 
-          # Clean up standard GNOME folders (Utilities, System) so they don't capture apps or show up
-          for std_folder in "Utilities" "System" "YaST"; do
+          # Динамически очищаем все стандартные папки вне зависимости от локали/языка системы
+          current_folders=$(gsettings get org.gnome.desktop.app-folders folder-children | tr -d "[]',")
+          for std_folder in $current_folders; do
+              [[ "$std_folder" == "default" ]] && continue
               gsettings set org.gnome.desktop.app-folders.folder:/org/gnome/desktop/app-folders/folders/$std_folder/ apps "[]" 2>/dev/null || true
               gsettings set org.gnome.desktop.app-folders.folder:/org/gnome/desktop/app-folders/folders/$std_folder/ categories "[]" 2>/dev/null || true
           done
 
-          # Force GNOME Shell to only use 'default' folder, removing Utilities and System entirely
           gsettings set org.gnome.desktop.app-folders folder-children "['default']"
+
+          # Установка монотонного чёрного фона рабочего стола для светлой и темной тем
+          gsettings set org.gnome.desktop.background picture-uri ''
+          gsettings set org.gnome.desktop.background picture-uri-dark ''
+          gsettings set org.gnome.desktop.background primary-color '#000000'
+          gsettings set org.gnome.desktop.background color-shading-type 'solid'
 GNOME_EOF
 
-        fixed "GNOME panel (with installed Flatpaks) and 'default' app folder successfully configured for user $REAL_USER"
+        fixed "GNOME panel, app folders, black background and layouts successfully configured for user $REAL_USER"
       else
-        info "Would configure GNOME panel and 'default' folder for user $REAL_USER (mode: audit)"
+        info "Would configure GNOME panel, icons/cursors and tiling layout for user $REAL_USER (mode: audit)"
       fi
     else
       warn "Could not determine graphical user for GNOME configuration."
@@ -1270,7 +1356,7 @@ GNOME_EOF
     info "Graphical environment not detected, skipping GNOME panel configuration."
   fi
 else
-  info "GNOME panel & app folders layout configuration skipped (set SETUP_GNOME_LAYOUT=true to activate)"
+  info "GNOME layout & extensions configuration skipped (set SETUP_GNOME_LAYOUT=true to activate)"
 fi
 
 # ===========================================================================
@@ -1284,7 +1370,6 @@ if [[ $MODE == apply ]]; then
   info "Full log written to: $LOG_FILE"
   info ""
   info "IMPORTANT: Reboot the system for kernel arguments and module blacklist to take full effect."
-  info "After reboot verify with: grubby --info=DEFAULT  and  sysctl -a | grep -E 'yama|kptr|bpf'"
 else
   info "Audit finished. No changes were made."
   info "To apply hardening:  sudo $0 --apply"
