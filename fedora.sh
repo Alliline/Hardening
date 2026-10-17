@@ -17,7 +17,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-VERSION='1.3'
+VERSION='1.4'
 MODE='audit'
 FORCE_SSH_KEEP=true          # set to false if you really want to remove SSH from public zone
 AGGRESSIVE_USERNS=false      # set to true to disable unprivileged user namespaces (breaks Flatpak/Podman rootless)
@@ -28,6 +28,7 @@ INSTALL_OPTIONAL_SOFTWARE=false
 INSTALL_HARDENED_MALLOC=false
 LOCKDOWN_BASHRC=false
 SETUP_SUPERIOR_USER=false
+SETUP_GNOME_LAYOUT=false
 SUPERIOR_USER=""
 
 ask_yn() {
@@ -165,6 +166,7 @@ elif [[ $MODE == apply ]]; then
   if ask_yn "3. Build and deploy Hardened Malloc?" "n"; then INSTALL_HARDENED_MALLOC=true; fi
   if ask_yn "4. Lockdown user profile files (.bashrc, etc. -> root ownership)?" "n"; then LOCKDOWN_BASHRC=true; fi
   if ask_yn "5. Configure a separate superior admin user for run0/privileges?" "n"; then SETUP_SUPERIOR_USER=true; fi
+  if ask_yn "6. Setup layout panel?" "n"; then SETUP_GNOME_LAYOUT=true; fi
 fi
 
 # ===========================================================================
@@ -901,6 +903,7 @@ dnf_apps=(
   ffmpeg-free 
   mediainfo
   cryptsetup
+  easyeffects
 )
 declare -A flatpak_apps=(
   [flatseal]="com.github.tchx84.Flatseal"
@@ -969,6 +972,31 @@ if [[ $INSTALL_OPTIONAL_SOFTWARE == true ]]; then
       warn "Package not found in DNF: $pkg"
     fi
   done
+
+  # Setup Easy Effects autostart if installed via DNF
+  if [[ $MODE == apply ]] && rpm -q easyeffects &>/dev/null; then
+    _target_user="${SUDO_USER:-$(logname 2>/dev/null || whoami)}"
+    if [[ "$_target_user" == "root" ]]; then
+      _target_user=$(awk -v tty="$(tty 2>/dev/null | sed 's|/dev/||')" '$2 == tty {print $1}' /proc/self/loginuid 2>/dev/null || true)
+      [[ -z "$_target_user" || "$_target_user" == "root" ]] && _target_user=$(users 2>/dev/null | awk '{print $1}')
+    fi
+    if [[ -n "$_target_user" && "$_target_user" != "root" ]]; then
+      sudo -u "$_target_user" bash << 'EE_EOF'
+        mkdir -p ~/.config/autostart
+        cat <<EOF > ~/.config/autostart/easyeffects-service.desktop
+[Desktop Entry]
+Type=Application
+Name=EasyEffects Service
+Exec=easyeffects --gapplication-service
+Hidden=false
+NoDisplay=false
+X-GNOME-Autostart-enabled=true
+Comment=Audio limiter, compressor and other effects for PipeWire applications
+EOF
+EE_EOF
+      fixed "Added Easy Effects (DNF) to user autostart"
+    fi
+  fi
 
 else
   info "Optional software deployment is skipped (set INSTALL_OPTIONAL_SOFTWARE=true in script to activate)"
@@ -1113,6 +1141,136 @@ if [[ $INSTALL_HARDENED_MALLOC == true ]]; then
 
 else
   info "Hardened malloc deployment is skipped (set INSTALL_HARDENED_MALLOC=true to activate)"
+fi
+
+# ===========================================================================
+# 19. GNOME Panel & App Folders Layout
+# ===========================================================================
+section '19. GNOME Panel & App Folders Layout'
+
+if [[ "$SETUP_GNOME_LAYOUT" == true ]]; then
+  if [[ "$IS_DESKTOP" == true ]]; then
+    REAL_USER="${SUDO_USER:-$(logname 2>/dev/null || whoami)}"
+    
+    if [[ "$REAL_USER" == "root" ]]; then
+      REAL_USER=$(awk -v tty="$(tty 2>/dev/null | sed 's|/dev/||')" '$2 == tty {print $1}' /proc/self/loginuid 2>/dev/null || true)
+      [[ -z "$REAL_USER" || "$REAL_USER" == "root" ]] && REAL_USER=$(users 2>/dev/null | awk '{print $1}')
+    fi
+
+    USER_HOME=$(getent passwd "$REAL_USER" | cut -d: -f6)
+    USER_UID=$(id -u "$REAL_USER" 2>/dev/null || echo 1000)
+    
+    if [[ -n "$REAL_USER" && "$REAL_USER" != "root" && -d "$USER_HOME" ]]; then
+      info "Configuring GNOME for user: $REAL_USER (home directory: $USER_HOME)"
+
+      if [[ "$MODE" == "apply" ]]; then
+        # Install GNOME extensions: Dash to Dock & Tiling Shell
+        info "Installing GNOME extensions (Dash to Dock, Tiling Shell)..."
+        dnf install -y python3-pip jq unzip &>/dev/null || true
+        
+        # Установка через утилиту gnome-extensions-cli (если доступна, либо скачивание uuid)
+        sudo -u "$REAL_USER" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$USER_UID/bus" bash << 'EXT_EOF'
+          # Используем официальные UUID расширений GNOME Shell
+          # Dash to Dock: dash-to-dock@micxgx.gmail.com
+          # Tiling Shell: tilingshell@ferrarodomenico.com (или аналогичный uuid)
+          pip install --user gnome-extensions-cli &>/dev/null || true
+          export PATH="$HOME/.local/bin:$PATH"
+          
+          # Установка Dash to dock и Tiling Shell
+          gext install dash-to-dock@micxgx.gmail.com 2>/dev/null || true
+          gext install tilingshell@ferrarodomenico.com 2>/dev/null || true
+          
+          # Включаем установленные расширения
+          gnome-extensions enable dash-to-dock@micxgx.gmail.com 2>/dev/null || true
+          gnome-extensions enable tilingshell@ferrarodomenico.com 2>/dev/null || true
+EXT_EOF
+        fixed "GNOME extensions (Dash to Dock, Tiling Shell) installed and enabled"
+
+        # Get list of installed Flatpak applications in .desktop format
+        flatpak_desktop_ids=""
+        if command -v flatpak &>/dev/null; then
+          flatpak_desktop_ids=$(sudo -u "$REAL_USER" flatpak list --app --columns=application 2>/dev/null | awk '{print $1".desktop"}' | tr '\n' ' ')
+        fi
+
+        sudo -u "$REAL_USER" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$USER_UID/bus" \
+        FLATPAK_IDS="$flatpak_desktop_ids" bash << 'GNOME_EOF'
+          # 1. Determine the correct desktop file for the terminal
+          TERMINAL_ID=""
+          for term_app in "org.gnome.Terminal.desktop" "org.fedoraproject.Console.desktop" "org.gnome.Console.desktop"; do
+              if [[ -f "/usr/share/applications/$term_app" ]] || [[ -f "$HOME/.local/share/applications/$term_app" ]]; then
+                  TERMINAL_ID="$term_app"
+                  break
+              fi
+          done
+          [[ -z "$TERMINAL_ID" ]] && TERMINAL_ID="org.gnome.Terminal.desktop"
+
+          # Base panel applications + all installed Flatpak applications
+          base_favs=("org.gnome.Nautilus.desktop" "$TERMINAL_ID" "org.gnome.Calculator.desktop")
+          
+          for f_app in $FLATPAK_IDS; do
+              # Check if .desktop file for Flatpak exists in system or user dirs
+              if [[ -f "/var/lib/flatpak/exports/share/applications/$f_app" ]] || \
+                 [[ -f "$HOME/.local/share/flatpak/exports/share/applications/$f_app" ]] || \
+                 [[ -f "/usr/share/applications/$f_app" ]]; then
+                  base_favs+=("$f_app")
+              fi
+          done
+
+          # Format array for gsettings (favorite-apps)
+          fav_quoted=()
+          for app in "${base_favs[@]}"; do
+              fav_quoted+=("'$app'")
+          done
+          FAV_APPS="[$(IFS=,; echo "${fav_quoted[*]}")]"
+          gsettings set org.gnome.shell favorite-apps "$FAV_APPS"
+
+          # 2. Place ALL non-pinned applications into the single 'default' folder
+          app_list=()
+          while IFS= read -r desktop_file; do
+              skip=false
+              for fav in "${base_favs[@]}"; do
+                  if [[ "$desktop_file" == "$fav" ]]; then
+                      skip=true
+                      break
+                  fi
+              done
+              if [[ "$skip" == "true" ]]; then
+                  continue
+              fi
+              app_list+=("'$desktop_file'")
+          done < <(find /usr/share/applications/ $HOME/.local/share/applications/ -maxdepth 1 -name "*.desktop" -exec basename {} \; 2>/dev/null | sort -u)
+
+          IFS=,
+          APPS_ARRAY="[${app_list[*]}]"
+          unset IFS
+
+          # Configure 'default' folder with all remaining apps
+          gsettings set org.gnome.desktop.app-folders.folder:/org/gnome/desktop/app-folders/folders/default/ name 'Default'
+          gsettings set org.gnome.desktop.app-folders.folder:/org/gnome/desktop/app-folders/folders/default/ apps "$APPS_ARRAY"
+          gsettings set org.gnome.desktop.app-folders.folder:/org/gnome/desktop/app-folders/folders/default/ categories "[]"
+
+          # Clean up standard GNOME folders (Utilities, System) so they don't capture apps or show up
+          for std_folder in "Utilities" "System" "YaST"; do
+              gsettings set org.gnome.desktop.app-folders.folder:/org/gnome/desktop/app-folders/folders/$std_folder/ apps "[]" 2>/dev/null || true
+              gsettings set org.gnome.desktop.app-folders.folder:/org/gnome/desktop/app-folders/folders/$std_folder/ categories "[]" 2>/dev/null || true
+          done
+
+          # Force GNOME Shell to only use 'default' folder, removing Utilities and System entirely
+          gsettings set org.gnome.desktop.app-folders folder-children "['default']"
+GNOME_EOF
+
+        fixed "GNOME panel (with installed Flatpaks) and 'default' app folder successfully configured for user $REAL_USER"
+      else
+        info "Would configure GNOME panel and 'default' folder for user $REAL_USER (mode: audit)"
+      fi
+    else
+      warn "Could not determine graphical user for GNOME configuration."
+    fi
+  else
+    info "Graphical environment not detected, skipping GNOME panel configuration."
+  fi
+else
+  info "GNOME panel & app folders layout configuration skipped (set SETUP_GNOME_LAYOUT=true to activate)"
 fi
 
 # ===========================================================================
