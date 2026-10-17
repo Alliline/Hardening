@@ -17,7 +17,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-VERSION='1.2'
+VERSION='1.3'
 MODE='audit'
 FORCE_SSH_KEEP=true          # set to false if you really want to remove SSH from public zone
 AGGRESSIVE_USERNS=false      # set to true to disable unprivileged user namespaces (breaks Flatpak/Podman rootless)
@@ -839,13 +839,19 @@ gnome_bloat_pkgs=(
   gnome-contacts
   gnome-calendar
   gnome-characters
-  evince
+  evince 
   cheese
+  snapshot 
   simple-scan
   yelp
   gnome-user-docs
   gnome-text-editor
   gnome-logs
+  mediawriter 
+  gnome-boxes
+  baobab 
+  papers
+  gnome-connections
 )
 
 if [[ $PURGE_GNOME_BLOAT == true ]]; then
@@ -862,6 +868,16 @@ if [[ $PURGE_GNOME_BLOAT == true ]]; then
       ok "GNOME app already absent: $pkg"
     fi
   done
+  if rpm -qa 'libreoffice*' &>/dev/null; then
+    if [[ $MODE == apply ]]; then
+      dnf remove -y 'libreoffice*' 2>/dev/null || true
+      fixed "Removed all LibreOffice packages"
+    else
+      warn "LibreOffice packages present (will be removed)"
+    fi
+  else
+    ok "LibreOffice already absent"
+  fi
 else
   info "GNOME bloatware removal is skipped (set PURGE_GNOME_BLOAT=true in script to activate)"
 fi
