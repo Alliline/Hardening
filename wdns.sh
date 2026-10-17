@@ -34,6 +34,7 @@ WDNS_NFT_FILE="$WDNS_DIR/wdns-output-filter.nft"
 WDNS_NFT_APPLY="$WDNS_DIR/apply-nft.sh"
 WDNS_NFT_FLUSH="$WDNS_DIR/flush-nft.sh"
 WDNS_ENSURE_SCRIPT="$WDNS_DIR/ensure.sh"
+NM_DISPATCHER_SCRIPT="/etc/NetworkManager/dispatcher.d/90-wdns-force-dns"
 
 # IPv4 loopback only. IPv6 is fully disabled.
 LISTEN_ADDRESSES="127.0.0.1"
@@ -239,11 +240,11 @@ force_nm_connections_dns() {
     log "NM connection «$conn»: DNS → 127.0.0.1 (ignore-auto-dns)"
   done < <(nmcli -g NAME connection show 2>/dev/null || true)
 
-  local active
-  while IFS= read -r active; do
-    [[ -z "$active" ]] && continue
-    nmcli connection up "$active" 2>/dev/null || true
-  done < <(nmcli -g NAME connection show --active 2>/dev/null || true)
+  local dev
+  while IFS= read -r dev; do
+    [[ -z "$dev" ]] && continue
+    nmcli device reapply "$dev" 2>/dev/null || true
+  done < <(nmcli -t -f DEVICE,STATE device status 2>/dev/null | grep ':connected' | cut -d: -f1 || true)
 }
 
 disable_ipv6_permanently() {
@@ -261,10 +262,7 @@ EOF_NM_IPV6
   chmod 0644 "$NM_IPV6_DISABLE_FILE"
 
   if command -v grubby >/dev/null 2>&1; then
-    if ! grubby --info=ALL 2>/dev/null | grep -q 'ipv6.disable=1'; then
-      grubby --update-kernel=ALL --args="ipv6.disable=1" 2>/dev/null || true
-      warn "Added kernel parameter ipv6.disable=1 (reboot required for full effect)"
-    fi
+    grubby --update-kernel=ALL --args="ipv6.disable=1" 2>/dev/null || true
   fi
 
   log "IPv6 disabled (sysctl + NetworkManager + kernel param)"
@@ -295,13 +293,26 @@ EOF_RESOLV
 }
 
 configure_resolved_for_no_conflict() {
+  # Важный момент: DNS=127.0.0.1
+  # На Fedora nsswitch предпочитает модуль «resolve» (systemd-resolved).
+  # Если у resolved нет upstream — curl/getaddrinfo падают,
+  # даже когда dig @127.0.0.1 и dnsmasq работают.
+  # Мы оставляем resolved живым, но заставляем его ходить только в dnsmasq.
   cat > "$RESOLVED_STUB_DROPIN" <<'EOF_RESOLVED'
 [Resolve]
 DNSStubListener=no
-DNS=
+DNS=127.0.0.1
 FallbackDNS=
+Domains=
+DNSSEC=no
+DNSOverTLS=no
 EOF_RESOLVED
   chmod 0644 "$RESOLVED_STUB_DROPIN"
+
+  # Neutralize distro tmpfiles rule that would re-symlink /etc/resolv.conf
+  # at boot (overrides /usr/lib/tmpfiles.d/systemd-resolve.conf).
+  : > /etc/tmpfiles.d/systemd-resolve.conf
+  chmod 0644 /etc/tmpfiles.d/systemd-resolve.conf
 
   systemctl restart "$RESOLVED_SERVICE" >/dev/null 2>&1 || true
   systemctl stop systemd-resolved-stub.socket 2>/dev/null || true
@@ -317,7 +328,7 @@ EOF_RESOLVED
     sleep 0.3
   done
 
-  log "systemd-resolved: stub listener disabled"
+  log "systemd-resolved: stub disabled, upstream → 127.0.0.1 (dnsmasq)"
 }
 
 build_dnsmasq_config() {
@@ -396,9 +407,10 @@ EOF_DNSMASQ
   done < "$DOH_BLOCKLIST_FILE"
 
   install -m 0644 "$dnsmasq_tmp" "$DNSMASQ_CONF_FILE"
-  install -m 0644 "$WHITELIST_SOURCE" "$WHITELIST_TARGET"
+  if [[ -f "$WHITELIST_SOURCE" ]]; then
+    install -m 0644 "$WHITELIST_SOURCE" "$WHITELIST_TARGET"
+  fi
   rm -f "$dnsmasq_tmp"
-
   if ! dnsmasq --test; then
     err "dnsmasq configuration test failed"
     exit 1
@@ -462,6 +474,11 @@ table inet wdns_whitelist {
     meta skuid $dnsmasq_uid tcp dport 53 accept
     meta skuid $dnsmasq_uid tcp dport 853 accept
 
+    # Разрешаем запросы локально на петлю (для приложений, идущих на 127.0.0.1:53)
+    oifname "lo" udp dport 53 accept
+    oifname "lo" tcp dport 53 accept
+
+    # Блокируем прямой уход DNS наружу для всех остальных
     udp dport 53 drop
     tcp dport 53 drop
     tcp dport 853 drop
@@ -476,11 +493,14 @@ EOF_NFT
 }
 
 write_nft_helper_scripts() {
+  local nft_bin
+  nft_bin="$(command -v nft || true)"
+  [[ -z "$nft_bin" ]] && nft_bin="/usr/sbin/nft"
   cat > "$WDNS_NFT_APPLY" <<EOF_APPLY
 #!/usr/bin/env bash
 set -euo pipefail
-nft delete table inet wdns_whitelist 2>/dev/null || true
-nft -f "$WDNS_NFT_FILE"
+$nft_bin delete table inet wdns_whitelist 2>/dev/null || true
+$nft_bin -f "$WDNS_NFT_FILE"
 EOF_APPLY
 
   cat > "$WDNS_NFT_FLUSH" <<'EOF_FLUSH'
@@ -492,10 +512,66 @@ EOF_FLUSH
   chmod 0755 "$WDNS_NFT_APPLY" "$WDNS_NFT_FLUSH"
 }
 
+write_nm_dispatcher() {
+  cat > "$NM_DISPATCHER_SCRIPT" <<'EOF_DISP'
+#!/usr/bin/env bash
+# WDNS: force local DNS on every connection up
+interface="$1"
+action="$2"
+
+case "$action" in
+  up|reapply|dhcp4-change|dhcp6-change)
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+
+# Skip virtual/loopback-type interfaces
+if [[ "$interface" == lo || "$interface" == docker* || "$interface" == veth* || \
+      "$interface" == br* || "$interface" == virbr* || "$interface" == tun* || \
+      "$interface" == tap* ]]; then
+  exit 0
+fi
+
+# Force DNS on the connection that just came up
+conn=$(nmcli -t -f GENERAL.CONNECTION device show "$interface" 2>/dev/null | cut -d: -f2-)
+if [[ -n "$conn" ]]; then
+  nmcli connection modify "$conn" \
+    ipv4.ignore-auto-dns yes \
+    ipv4.dns "127.0.0.1" \
+    ipv4.dns-priority -1 \
+    ipv6.method disabled \
+    ipv6.ignore-auto-dns yes \
+    ipv6.dns "" 2>/dev/null || true
+fi
+
+# Ensure resolv.conf is correct and immutable
+chattr -i /etc/resolv.conf 2>/dev/null || true
+cat > /etc/resolv.conf <<'EOF_RESOLV'
+# generated by wdns — IPv4 only
+nameserver 127.0.0.1
+options edns0 trust-ad
+EOF_RESOLV
+chmod 0644 /etc/resolv.conf
+chattr +i /etc/resolv.conf 2>/dev/null || true
+
+# Make sure dnsmasq is listening
+if ! ss -lntup 2>/dev/null | grep -qE '127\.0\.0\.1:53\b'; then
+  systemctl restart dnsmasq.service 2>/dev/null || true
+fi
+
+exit 0
+EOF_DISP
+  chmod 0755 "$NM_DISPATCHER_SCRIPT"
+  chown root:root "$NM_DISPATCHER_SCRIPT"
+}
+
 write_ensure_script() {
   cat > "$WDNS_ENSURE_SCRIPT" <<'EOF_ENSURE'
 #!/usr/bin/env bash
-set -euo pipefail
+# Не используем set -e: boot-time ensure должен быть максимально толерантным
+set -uo pipefail
 
 WDNS_DIR="/etc/wdns-whitelist"
 RESOLV_CONF="/etc/resolv.conf"
@@ -505,19 +581,23 @@ WDNS_NFT_APPLY="$WDNS_DIR/apply-nft.sh"
 
 log() { echo "[wdns-ensure] $*"; }
 
-# Ensure resolv.conf points to local dnsmasq and is immutable
+# 1. Всегда переписываем и лочим resolv.conf (симлинк от resolved/tmpfiles убиваем)
 chattr -i "$RESOLV_CONF" 2>/dev/null || true
-if [[ ! -f "$RESOLV_CONF" ]] || ! grep -q 'nameserver 127.0.0.1' "$RESOLV_CONF" 2>/dev/null; then
-  cat > "$RESOLV_CONF" <<'EOF_RESOLV'
+rm -f "$RESOLV_CONF"
+cat > "$RESOLV_CONF" <<'EOF_RESOLV'
 # generated by wdns — IPv4 only
 nameserver 127.0.0.1
 options edns0 trust-ad
 EOF_RESOLV
-  chmod 0644 "$RESOLV_CONF"
-fi
+chmod 0644 "$RESOLV_CONF"
 chattr +i "$RESOLV_CONF" 2>/dev/null || true
 
-# Force DNS settings on all relevant NM connections
+# 1b. Гарантируем, что resolved смотрит только в dnsmasq
+if [[ -f /etc/systemd/resolved.conf.d/90-wdns-disable-stub.conf ]]; then
+  systemctl restart systemd-resolved.service 2>/dev/null || true
+fi
+
+# 2. Повторно форсим DNS на всех NM-соединениях
 if command -v nmcli >/dev/null 2>&1; then
   while IFS= read -r conn; do
     [[ -z "$conn" ]] && continue
@@ -532,23 +612,29 @@ if command -v nmcli >/dev/null 2>&1; then
       ipv6.ignore-auto-dns yes \
       ipv6.dns "" 2>/dev/null || true
   done < <(nmcli -g NAME connection show 2>/dev/null || true)
+
+  while IFS= read -r dev; do
+    [[ -z "$dev" ]] && continue
+    nmcli device reapply "$dev" 2>/dev/null || true
+  done < <(nmcli -t -f DEVICE,STATE device status 2>/dev/null | grep ':connected' | cut -d: -f1 || true)
 fi
 
-# Ensure dnsmasq is running and listening
-systemctl start "$DNSMASQ_SERVICE" 2>/dev/null || true
-if ! ss -lntup 2>/dev/null | grep -qE '127\.0\.0\.1:53\b'; then
-  systemctl restart "$DNSMASQ_SERVICE" 2>/dev/null || true
-  sleep 1
-fi
+# 3. Гарантируем, что dnsmasq слушает 127.0.0.1:53
+systemctl restart "$DNSMASQ_SERVICE" 2>/dev/null || true
 
-# Ensure nftables table is present
-if ! nft list table inet wdns_whitelist >/dev/null 2>&1; then
-  if [[ -x "$WDNS_NFT_APPLY" && -f "$WDNS_NFT_FILE" ]]; then
-    "$WDNS_NFT_APPLY" || true
+for i in {1..15}; do
+  if ss -lntup 2>/dev/null | grep -qE '127\.0\.0\.1:53\b'; then
+    break
   fi
+  sleep 1
+done
+
+# 4. Применяем nftables (после firewalld, см. unit)
+if [[ -x "$WDNS_NFT_APPLY" && -f "$WDNS_NFT_FILE" ]]; then
+  "$WDNS_NFT_APPLY" || true
 fi
 
-log "ensure completed"
+log "ensure completed successfully"
 EOF_ENSURE
   chmod 0755 "$WDNS_ENSURE_SCRIPT"
 }
@@ -557,9 +643,10 @@ write_wdns_nft_service() {
   cat > "/etc/systemd/system/$WDNS_NFT_SERVICE" <<EOF_UNIT
 [Unit]
 Description=WDNS host output nftables restrictions
-After=network-pre.target
-Before=NetworkManager.service
-Wants=network-pre.target
+After=network-pre.target network.target
+After=firewalld.service
+Wants=network.target
+# Не делаем Requires=firewalld — на серверах без firewalld тоже должно работать
 
 [Service]
 Type=oneshot
@@ -576,14 +663,19 @@ EOF_UNIT
 write_wdns_ensure_service() {
   cat > "/etc/systemd/system/$WDNS_ENSURE_SERVICE" <<EOF_UNIT
 [Unit]
-Description=WDNS post-NetworkManager ensure (resolv.conf, DNS, nft, dnsmasq)
-After=NetworkManager.service dnsmasq.service
-Wants=NetworkManager.service
+Description=WDNS boot-time DNS and firewall enforcement
+Wants=NetworkManager.service dnsmasq.service
+After=NetworkManager.service dnsmasq.service network.target
+After=firewalld.service
+After=wdns-nftables.service
+Requires=wdns-nftables.service
+# Не ставим network-online.target — иначе возможен deadlock (wait-online ждёт DNS)
 
 [Service]
 Type=oneshot
 ExecStart=$WDNS_ENSURE_SCRIPT
 RemainAfterExit=yes
+TimeoutStartSec=60
 
 [Install]
 WantedBy=multi-user.target
@@ -648,13 +740,14 @@ apply_all() {
   build_dnsmasq_config "$dns_servers_csv"
 
   configure_networkmanager_static_resolv
-  systemctl restart "$NM_SERVICE" >/dev/null 2>&1 || true
+  nmcli connection reload 2>/dev/null || true
   sleep 1
   force_nm_connections_dns
 
   apply_firewall
 
   write_ensure_script
+  write_nm_dispatcher
   write_wdns_ensure_service
   systemctl daemon-reload
   systemctl enable "$WDNS_ENSURE_SERVICE" >/dev/null 2>&1 || true
@@ -691,12 +784,13 @@ restore_defaults() {
   systemctl disable "$WDNS_NFT_SERVICE" >/dev/null 2>&1 || true
 
   rm -f "$DNSMASQ_CONF_FILE" \
-        "$NM_DNS_NONE_FILE" \
-        "$NM_IPV6_DISABLE_FILE" \
-        "$RESOLVED_STUB_DROPIN" \
-        "$SYSCTL_FILE" \
-        "/etc/systemd/system/$WDNS_NFT_SERVICE" \
-        "/etc/systemd/system/$WDNS_ENSURE_SERVICE"
+      "$NM_DNS_NONE_FILE" \
+      "$NM_IPV6_DISABLE_FILE" \
+      "$RESOLVED_STUB_DROPIN" \
+      "$SYSCTL_FILE" \
+      "$NM_DISPATCHER_SCRIPT" \
+      "/etc/systemd/system/$WDNS_NFT_SERVICE" \
+      "/etc/systemd/system/$WDNS_ENSURE_SERVICE"
 
   rm -rf "$WDNS_DIR"
 
