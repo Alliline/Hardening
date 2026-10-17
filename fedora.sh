@@ -17,10 +17,33 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-VERSION='1.0'
+VERSION='1.2'
 MODE='audit'
 FORCE_SSH_KEEP=true          # set to false if you really want to remove SSH from public zone
 AGGRESSIVE_USERNS=false      # set to true to disable unprivileged user namespaces (breaks Flatpak/Podman rootless)
+
+# Интерактивные параметры (будут запрошены в режиме apply)
+PURGE_GNOME_BLOAT=false
+INSTALL_OPTIONAL_SOFTWARE=false
+INSTALL_HARDENED_MALLOC=false
+LOCKDOWN_BASHRC=false
+SETUP_SUPERIOR_USER=false
+SUPERIOR_USER=""
+
+ask_yn() {
+  local prompt_msg="$1"
+  local default_val="${2:-y}"
+  local ans
+  if [[ "$MODE" != "apply" ]]; then
+    echo "$default_val"
+    return
+  fi
+  local hint="Y/n"
+  [[ "$default_val" =~ ^[nN]$ ]] && hint="y/N"
+  read -rp "$prompt_msg [$hint]: " ans
+  ans="${ans:-$default_val}"
+  [[ "$ans" =~ ^[yY][eE]?[sS]?$ ]]
+}
 
 # ---------------------------------------------------------------------------
 # Argument parsing
@@ -31,7 +54,7 @@ for arg in "$@"; do
     --audit)   MODE='audit' ;;
     --help|-h)
       cat <<'HELP'
-Usage: sudo ./secure-fedora-ultimate.sh [--audit|--apply|--help]
+Usage: sudo ./fedora.sh [--audit|--apply|--help]
 
   --audit   Report current security posture (default, no changes)
   --apply   Backup managed files, apply hardening, log everything
@@ -135,6 +158,13 @@ printf 'Desktop detected: %s\n' "$IS_DESKTOP"
 
 if [[ $MODE == audit ]]; then
   info "Audit mode — no changes will be made. Use --apply to enforce."
+elif [[ $MODE == apply ]]; then
+  section 'Interactive Hardening Configuration'
+  if ask_yn "1. Purge unnecessary GNOME bloatware (safe apps only)?" "n"; then PURGE_GNOME_BLOAT=true; fi
+  if ask_yn "2. Install optional software and secure Flatpaks?" "n"; then INSTALL_OPTIONAL_SOFTWARE=true; fi
+  if ask_yn "3. Build and deploy Hardened Malloc?" "n"; then INSTALL_HARDENED_MALLOC=true; fi
+  if ask_yn "4. Lockdown user profile files (.bashrc, etc. -> root ownership)?" "n"; then LOCKDOWN_BASHRC=true; fi
+  if ask_yn "5. Configure a separate superior admin user for run0/privileges?" "n"; then SETUP_SUPERIOR_USER=true; fi
 fi
 
 # ===========================================================================
@@ -142,7 +172,6 @@ fi
 # ===========================================================================
 section '1. Bootloader & Kernel Security Parameters'
 
-# Core set (safe + high value)
 KARGS_CORE=(
   slab_nomerge
   init_on_alloc=1
@@ -158,18 +187,16 @@ KARGS_CORE=(
   random.trust_bootloader=off
 )
 
-# Extra aggressive (may break some hardware / VMs)
 KARGS_EXTRA=(
   spectre_v2=on
   spec_store_bypass_disable=on
   l1d_flush=on
   gather_data_sampling=force
-  module.sig_enforce=1
-  lockdown=confidentiality
+  #module.sig_enforce=1
+  #lockdown=confidentiality
 )
 
 if command -v grubby &>/dev/null; then
-  # Remove rhgb quiet (information leak + slower recovery)
   if grubby --info=DEFAULT 2>/dev/null | grep -qE 'rhgb|quiet'; then
     if [[ $MODE == apply ]]; then
       grubby --update-kernel=ALL --remove-args="rhgb quiet" && \
@@ -202,7 +229,6 @@ if command -v grubby &>/dev/null; then
     fi
   fi
 
-  # Ensure /etc/kernel/cmdline is updated and persists all arguments for kernel-install
   if [[ $MODE == apply ]]; then
     all_current_args=$(grubby --info=DEFAULT 2>/dev/null | grep '^args=' | cut -d= -f2- | tr -d '"' || true)
     if [[ -n "$all_current_args" ]]; then
@@ -242,13 +268,13 @@ fi
 section '3. Systemd DefaultTimeoutStopSec'
 
 TIMEOUT_CONF="/etc/systemd/system.conf.d/99-timeout.conf"
-if [[ -f $TIMEOUT_CONF ]] && grep -q 'DefaultTimeoutStopSec=3s' "$TIMEOUT_CONF"; then
-  ok "DefaultTimeoutStopSec=3s already set"
+if [[ -f $TIMEOUT_CONF ]] && grep -q 'DefaultTimeoutStopSec=5s' "$TIMEOUT_CONF"; then
+  ok "DefaultTimeoutStopSec=5s already set"
 elif [[ $MODE == apply ]]; then
   write_managed "$TIMEOUT_CONF" 0644 <<'EOF'
 [Manager]
-DefaultTimeoutStopSec=3s
-DefaultTimeoutStartSec=10s
+DefaultTimeoutStopSec=5s
+DefaultTimeoutStartSec=15s
 EOF
   systemctl daemon-reload
 else
@@ -260,14 +286,20 @@ fi
 # ===========================================================================
 section '4. Services & Packages Reduction'
 
+if [[ $MODE == apply ]]; then
+  if systemctl is-masked --quiet gssproxy.service 2>/dev/null; then
+    systemctl unmask gssproxy.service 2>/dev/null || true
+    fixed "Unmasked gssproxy service"
+  fi
+  systemctl mask var-lib-nfs-rpc_pipefs.mount 2>/dev/null || true
+  fixed "Masked var-lib-nfs-rpc_pipefs.mount to prevent boot errors"
+fi
+
 services_to_mask=(
   wsdd.service wsdd.socket
-  gssproxy.service
   avahi-daemon.service avahi-daemon.socket
-  # dnf5-daemon.service
   abrtd.service abrt-journal-core.service abrt-oops.service
   abrt-vmcore.service abrt-xorg.service
-  iscsi.service iscsid.service iscsiuio.service
   livesys.service livesys-late.service
   flatpak-add-fedora-repos.service
   cups.service cups.socket cups.path
@@ -289,7 +321,7 @@ for srv in "${services_to_mask[@]}"; do
   fi
 done
 
-pkgs_to_remove=(wsdd psimon firefox)
+pkgs_to_remove=(wsdd firefox)
 for pkg in "${pkgs_to_remove[@]}"; do
   if rpm -q "$pkg" &>/dev/null; then
     if [[ $MODE == apply ]]; then
@@ -385,7 +417,6 @@ if command -v firewall-cmd &>/dev/null; then
   fi
 
   if [[ $MODE == apply ]]; then
-    # Public zone → DROP (very aggressive)
     firewall-cmd --permanent --zone=public --set-target=DROP 2>/dev/null || true
     firewall-cmd --permanent --zone=public --remove-service=mdns 2>/dev/null || true
     firewall-cmd --permanent --zone=public --remove-service=ssh 2>/dev/null || true
@@ -400,14 +431,12 @@ if command -v firewall-cmd &>/dev/null; then
       [[ "$confirm" == "yes" ]] || die "Aborted by user."
     fi
 
-    # WireGuard / VPN client zone
     if ! firewall-cmd --permanent --get-zones 2>/dev/null | grep -qw wireguard; then
       firewall-cmd --permanent --new-zone=wireguard >/dev/null
       fixed "Created firewalld zone: wireguard"
     fi
     firewall-cmd --permanent --zone=wireguard --set-target=DROP 2>/dev/null || true
 
-    # Bind existing VPN interfaces (wg* and tun*)
     for iface in $(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | grep -E '^(wg|tun)[0-9]+$' || true); do
       cur=$(firewall-cmd --get-zone-of-interface="$iface" 2>/dev/null || true)
       if [[ $cur != wireguard ]]; then
@@ -418,7 +447,6 @@ if command -v firewall-cmd &>/dev/null; then
       fi
     done
 
-    # Drop multicast on public + wireguard
     for zone in public wireguard; do
       firewall-cmd --permanent --zone="$zone" \
         --add-rich-rule='rule family=ipv4 destination address=224.0.0.0/4 drop' 2>/dev/null || true
@@ -436,7 +464,7 @@ else
 fi
 
 # ===========================================================================
-# 8. Kernel Sysctl (secureblue-inspired + extra)
+# 8. Kernel Sysctl
 # ===========================================================================
 section '8. Kernel Sysctl Hardening'
 
@@ -493,7 +521,6 @@ fs.protected_regular = 2
 fs.protected_fifos = 2
 fs.protected_hardlinks = 1
 fs.protected_symlinks = 1
-# fs.binfmt_misc.status = 0
 
 # Memory / ASLR
 dev.tty.ldisc_autoload = 0
@@ -513,13 +540,11 @@ fi
 if [[ $MODE == apply ]]; then
   write_managed "$SYSCTL_FILE" 0644 <<<"$SYSCTL_CONTENT"
 
-  # Capture only stderr (errors). "2>&1 >/dev/null" order is intentional.
   sysctl_err=$(sysctl --system 2>&1 >/dev/null || true)
 
   if [[ -z "$sysctl_err" ]]; then
     fixed "sysctl parameters applied cleanly"
   else
-    # Extract offending key names from sysctl stderr
     mapfile -t failed_keys < <(
       printf '%s\n' "$sysctl_err" \
         | sed -nE '
@@ -557,7 +582,6 @@ else
   fi
 fi
 
-# Core dumps via limits
 LIMITS_FILE="/etc/security/limits.d/99-nocore.conf"
 if [[ -f $LIMITS_FILE ]] && grep -q 'hard core 0' "$LIMITS_FILE"; then
   ok "Core dumps disabled via limits"
@@ -582,9 +606,8 @@ wifi.scan-rand-mac-address=yes
 
 [connection]
 wifi.cloned-mac-address=random
-# ethernet.cloned-mac-address=random
 EOF
-  fixed "Wi-Fi + Ethernet MAC randomization enabled"
+  fixed "Wi-Fi MAC randomization enabled"
 else
   warn "MAC randomization not configured"
 fi
@@ -622,9 +645,9 @@ for unit in dnf-makecache.timer packagekit.service fwupd-refresh.timer; do
 done
 
 # ===========================================================================
-# 11. SELinux
+# 11. SELinux Enforcement & Policy Hardening
 # ===========================================================================
-section '11. SELinux Enforcement'
+section '11. SELinux Enforcement & Policy Hardening'
 
 if command -v getenforce &>/dev/null; then
   current=$(getenforce 2>/dev/null || echo Unknown)
@@ -640,6 +663,29 @@ if command -v getenforce &>/dev/null; then
   else
     warn "SELinux is $current (will be set to Enforcing)"
   fi
+
+  selinux_booleans=(
+    "deny_ptrace=1"
+    #"secure_mode_insmod=1"
+  )
+  for bool_setting in "${selinux_booleans[@]}" ; do
+    b_name="${bool_setting%%=*}"
+    b_val="${bool_setting##*=}"
+    if command -v getsebool &>/dev/null; then
+      cur_bool=$(getsebool "$b_name" 2>/dev/null | awk '{print $3}')
+      if [[ "$cur_bool" == "$b_val" ]]; then
+        ok "SELinux boolean $b_name is $b_val"
+      elif [[ $MODE == apply ]]; then
+        if setsebool -P "$b_name" "$b_val" 2>/dev/null; then
+          fixed "Set SELinux boolean $b_name to $b_val"
+        else
+          warn "Failed to set SELinux boolean $b_name to $b_val"
+        fi
+      else
+        warn "SELinux boolean $b_name is $cur_bool (expected $b_val)"
+      fi
+    fi
+  done
 else
   warn "SELinux tools not found"
 fi
@@ -676,14 +722,10 @@ install jffs2 /bin/false
 install hfs /bin/false
 install hfsplus /bin/false
 install udf /bin/false
-# squashfs is used by live images and some containers — keep if needed
-# install squashfs /bin/false
 
-# Hardware that is rarely needed and increases attack surface
+# Hardware that is rarely needed
 install firewire-core /bin/false
 install floppy /bin/false
-# install thunderbolt /bin/false   # uncomment if you don't use Thunderbolt
-# install bluetooth /bin/false     # uncomment for maximum Bluetooth lockdown
 MOD_EOF
 )
 
@@ -731,11 +773,16 @@ if [[ -f $DNF_CONF ]]; then
     ok "DNF gpgcheck already strict"
   elif [[ $MODE == apply ]]; then
     backup_file "$DNF_CONF"
-    sed -i 's/^gpgcheck=.*/gpgcheck=1/' "$DNF_CONF" || echo 'gpgcheck=1' >> "$DNF_CONF"
-    if ! grep -q '^localpkg_gpgcheck=' "$DNF_CONF"; then
-      echo 'localpkg_gpgcheck=1' >> "$DNF_CONF"
+    if grep -qE '^[[:space:]]*gpgcheck[[:space:]]*=' "$DNF_CONF"; then
+      sed -i 's/^[[:space:]]*gpgcheck[[:space:]]*=.*/gpgcheck=1/' "$DNF_CONF"
     else
-      sed -i 's/^localpkg_gpgcheck=.*/localpkg_gpgcheck=1/' "$DNF_CONF"
+      sed -i '/^\[main\]/a gpgcheck=1' "$DNF_CONF"
+    fi
+
+    if grep -qE '^[[:space:]]*localpkg_gpgcheck[[:space:]]*=' "$DNF_CONF"; then
+      sed -i 's/^[[:space:]]*localpkg_gpgcheck[[:space:]]*=.*/localpkg_gpgcheck=1/' "$DNF_CONF"
+    else
+      sed -i '/^\[main\]/a localpkg_gpgcheck=1' "$DNF_CONF"
     fi
     fixed "DNF gpgcheck + localpkg_gpgcheck enforced"
   else
@@ -744,55 +791,46 @@ if [[ -f $DNF_CONF ]]; then
 fi
 
 # ===========================================================================
-# 15. Complete Telemetry & Metrics Blocking / Removal
+# 15. User Profile Files Lockdown (.bashrc protection)
 # ===========================================================================
-section '15. Telemetry & Metrics Removal'
+section '15. User Profile Files Lockdown'
 
-telemetry_services=(
-  eos-event-recorder-daemon.service
-  metrics-collector.service
-)
+if [[ $LOCKDOWN_BASHRC == true ]]; then
+  info "Lockdown of user profile files is enabled (LOCKDOWN_BASHRC=true)"
+  REAL_USER_LOCK="${SUDO_USER:-$(logname 2>/dev/null || whoami)}"
+  USER_HOME_DIR=$(getent passwd "$REAL_USER_LOCK" | cut -d: -f6)
 
-for srv in "${telemetry_services[@]}"; do
-  if systemctl is-enabled --quiet "$srv" 2>/dev/null || \
-     systemctl is-active  --quiet "$srv" 2>/dev/null; then
-    if [[ $MODE == apply ]]; then
-      systemctl disable --now "$srv" 2>/dev/null || true
-      systemctl mask "$srv" 2>/dev/null || true
-      fixed "Masked telemetry service: $srv"
-    else
-      warn "Active telemetry service found: $srv"
-    fi
+  if [[ -n "$USER_HOME_DIR" && -d "$USER_HOME_DIR" ]]; then
+    profile_files=(".bashrc" ".bash_profile" ".profile" ".bash_logout" ".zshrc")
+    for pfile in "${profile_files[@]}"; do
+      fpath="$USER_HOME_DIR/$pfile"
+      if [[ -f "$fpath" ]]; then
+        current_owner=$(stat -c '%U' "$fpath" 2>/dev/null)
+        if [[ "$current_owner" == "root" ]]; then
+          ok "Profile file already owned by root: $pfile"
+        elif [[ $MODE == apply ]]; then
+          backup_file "$fpath"
+          chown root:root "$fpath"
+          chmod 0644 "$fpath"
+          fixed "Locked down profile file (chown root:root): $pfile"
+        else
+          warn "Profile file owned by $current_owner (will be changed to root:root): $pfile"
+        fi
+      fi
+    done
   else
-    ok "Telemetry service absent or already disabled: $srv"
+    warn "Could not determine valid home directory for profile lockdown."
   fi
-done
-
-telemetry_pkgs=(
-  eos-metrics
-  eos-metrics-instrumentation
-  eos-event-recorder-daemon
-)
-
-for pkg in "${telemetry_pkgs[@]}"; do
-  if rpm -q "$pkg" &>/dev/null; then
-    if [[ $MODE == apply ]]; then
-      dnf remove -y --noautoremove "$pkg" 2>/dev/null || true
-      fixed "Removed telemetry package: $pkg"
-    else
-      warn "Telemetry package present: $pkg"
-    fi
-  else
-    ok "Telemetry package absent: $pkg"
-  fi
-done
+else
+  info "User profile lockdown skipped (set LOCKDOWN_BASHRC=true to activate)"
+fi
 
 # ===========================================================================
 # 16. Optional GNOME Bloatware Removal
 # ===========================================================================
 section '16. Optional GNOME Bloatware Removal'
 
-PURGE_GNOME_BLOAT=true
+# Исключён gnome-software во избежание удаления dnf5 / PackageKit
 gnome_bloat_pkgs=(
   gnome-tour
   gnome-weather
@@ -829,11 +867,10 @@ else
 fi
 
 # ===========================================================================
-# 17. Optional Software & Security Tools Deployment (Strict Flatpak / DNF)
+# 17. Optional Software Deployment
 # ===========================================================================
 section '17. Optional Software Deployment'
 
-INSTALL_OPTIONAL_SOFTWARE=true
 dnf_apps=(
   htop
   mc
@@ -848,7 +885,6 @@ dnf_apps=(
   ffmpeg-free 
   mediainfo
   cryptsetup
-  nethogs
 )
 declare -A flatpak_apps=(
   [flatseal]="com.github.tchx84.Flatseal"
@@ -923,11 +959,9 @@ else
 fi
 
 # ===========================================================================
-# 18. Hardened Malloc & Flatpak Sandbox Hardening (Secureblue-style Default)
+# 18. Hardened Malloc & Flatpak Sandbox Hardening
 # ===========================================================================
 section '18. Hardened Malloc & Flatpak Sandbox Hardening'
-
-INSTALL_HARDENED_MALLOC=true
 
 if [[ $INSTALL_HARDENED_MALLOC == true ]]; then
   LIB_DEST="/usr/local/lib/libhardened_malloc.so"
@@ -935,10 +969,8 @@ if [[ $INSTALL_HARDENED_MALLOC == true ]]; then
   WORK_DIR="/var/tmp/hardened_malloc_build"
   HASH_FILE="/var/lib/hardened_malloc.sha256"
 
-  # Определяем реального пользователя системы
   REAL_USER="${SUDO_USER:-$(logname 2>/dev/null || whoami)}"
 
-  # Проверка состояния в режиме аудита
   if [[ -f "$LIB_DEST" ]]; then
     ok "Hardened malloc library is present at $LIB_DEST"
   else
@@ -988,21 +1020,19 @@ if [[ $INSTALL_HARDENED_MALLOC == true ]]; then
     warn "Hardened malloc compilation pending (mode: audit)"
   fi
 
-  # Настройка глобального системного дефолта (как в secureblue)
   if command -v flatpak &>/dev/null; then
     section '18.1. Flatpak Global System Defaults & Sandbox Hardening'
 
     if [[ $MODE == apply ]]; then
-      info "Applying global system-wide Flatpak override for hardened_malloc..."
-      # Прописываем глобально на уровне системы (--system). 
-      # Это переживает сброс (Reset) в Flatseal для отдельных приложений.
-      flatpak override --system --filesystem="$LIB_DEST":ro --env=LD_PRELOAD="$LIB_DEST"
-      fixed "Global system Flatpak default set: LD_PRELOAD enabled for all apps."
+      info "Applying default Flatpak override for hardened_malloc (overridable via Flatseal)..."
+      sudo -u "$REAL_USER" flatpak override --user \
+        --filesystem="$LIB_DEST":ro \
+        --env=LD_PRELOAD="$LIB_DEST"
+      fixed "Default Flatpak policy set: LD_PRELOAD enabled for all apps (customizable in Flatseal)."
     else
-      info "Would apply global system Flatpak override for hardened_malloc (mode: audit)"
+      info "Would apply default Flatpak override for hardened_malloc (mode: audit)"
     fi
 
-    # Аудит и ужесточение прав для уже установленных приложений
     mapfile -t installed_flatpaks < <(sudo -u "$REAL_USER" flatpak list --app --columns=application 2>/dev/null || true)
     
     if (( ${#installed_flatpaks[@]} > 0 )); then
@@ -1021,22 +1051,33 @@ if [[ $INSTALL_HARDENED_MALLOC == true ]]; then
         if grep -qE 'devices=all' <<< "$app_info"; then has_full_device=true; fi
         if grep -qE 'sockets=.*session-bus' <<< "$app_info"; then has_session_bus=true; fi
 
-        # Формируем команду для принудительного закрытия дыр по умолчанию
-        enforce_cmd="flatpak override --user"
-        [[ $has_x11 == true ]]         && enforce_cmd+=" --nosocket=x11"
-        [[ $has_host_fs == true ]]     && enforce_cmd+=" --nofilesystem=host"
-        [[ $has_full_device == true ]] && enforce_cmd+=" --nodevice=all"
-        [[ $has_session_bus == true ]] && enforce_cmd+=" --nosocket=session-bus"
-        enforce_cmd+=" $app"
+        override_args=(override --user)
+
+        [[ $has_x11 == true ]] &&
+          override_args+=(--nosocket=x11)
+
+        [[ $has_host_fs == true ]] &&
+          override_args+=(--nofilesystem=host)
+
+        [[ $has_full_device == true ]] &&
+          override_args+=(--nodevice=all)
+
+        [[ $has_session_bus == true ]] &&
+          override_args+=(--nosocket=session-bus)
 
         if [[ $MODE == apply ]]; then
-          # Если у приложения были небезопасные права — принудительно забираем их (но пользователь сможет вернуть их в Flatseal при необходимости)
-          if [[ $has_x11 == true || $has_host_fs == true || $has_full_device == true || $has_session_bus == true ]]; then
-            eval "$enforce_cmd" 2>/dev/null || true
-            fixed "Revoked risky broad permissions for: $app"
+          if [[ $has_x11 == true || $has_host_fs == true ||
+                $has_full_device == true || $has_session_bus == true ]]; then
+
+            if sudo -u "$REAL_USER" flatpak "${override_args[@]}" "$app"; then
+              fixed "Revoked selected broad permissions for: $app"
+            else
+              warn "Failed to revoke permissions for: $app"
+            fi
           fi
         else
-          if [[ $has_x11 == true || $has_host_fs == true || $has_full_device == true || $has_session_bus == true ]]; then
+          if [[ $has_x11 == true || $has_host_fs == true ||
+                $has_full_device == true || $has_session_bus == true ]]; then
             warn "App '$app' currently has broad permissions (will be restricted on --apply):"
             [[ $has_x11 == true ]]         && info "    - Uses X11 socket"
             [[ $has_host_fs == true ]]     && info "    - Host filesystem access"
