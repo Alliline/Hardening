@@ -17,7 +17,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-VERSION='1.5'
+VERSION='1.6'
 MODE='audit'
 FORCE_SSH_KEEP=true          # set to false if you really want to remove SSH from public zone
 AGGRESSIVE_USERNS=false      # set to true to disable unprivileged user namespaces (breaks Flatpak/Podman rootless)
@@ -29,6 +29,7 @@ INSTALL_HARDENED_MALLOC=false
 LOCKDOWN_BASHRC=false
 SETUP_SUPERIOR_USER=false
 SETUP_GNOME_LAYOUT=false
+SETUP_SYSTEM_PREFS=false
 SUPERIOR_USER=""
 
 ask_yn() {
@@ -167,6 +168,7 @@ elif [[ $MODE == apply ]]; then
   if ask_yn "4. Lockdown user profile files (.bashrc, etc. -> root ownership)?" "n"; then LOCKDOWN_BASHRC=true; fi
   if ask_yn "5. Configure a separate superior admin user for run0/privileges?" "n"; then SETUP_SUPERIOR_USER=true; fi
   if ask_yn "6. Setup GNOME layout, extensions, icons/cursors & tiling?" "n"; then SETUP_GNOME_LAYOUT=true; fi
+  if ask_yn "7. Apply recommended system preferences (locale, power, privacy, workspaces...)?" "n"; then SETUP_SYSTEM_PREFS=true; fi
 fi
 
 # ===========================================================================
@@ -1168,54 +1170,66 @@ if [[ "$SETUP_GNOME_LAYOUT" == true ]]; then
       info "Configuring GNOME for user: $REAL_USER (home directory: $USER_HOME)"
 
       if [[ "$MODE" == "apply" ]]; then
-        # Install GNOME extensions and dependencies
-        info "Installing GNOME extensions (Dash to Dock, Tiling Shell)..."
-        dnf install -y python3-pip jq unzip curl git &>/dev/null || true
+        # Install GNOME extensions and dependencies (with check if already installed)
+        info "Checking and installing GNOME extensions (Dash to Dock, Tiling Shell)..."
+        dnf install -y python3-pip jq unzip curl git glib2-devel &>/dev/null || true
         
-        sudo -u "$REAL_USER" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$USER_UID/bus" bash << 'EXT_EOF'
+        sudo -u "$REAL_USER" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$USER_UID/bus" XDG_RUNTIME_DIR="/run/user/$USER_UID" bash << 'EXT_EOF'
           pip install --user gnome-extensions-cli &>/dev/null || true
           export PATH="$HOME/.local/bin:$PATH"
           
-          gext install dash-to-dock@micxgx.gmail.com 2>/dev/null || true
-          gext install tilingshell@ferrarodomenico.com 2>/dev/null || true
+          if ! gnome-extensions list | grep -q "dash-to-dock@micxgx.gmail.com"; then
+              gext install dash-to-dock@micxgx.gmail.com 2>/dev/null || true
+          fi
+          if ! gnome-extensions list | grep -q "tilingshell@ferrarodomenico.com"; then
+              gext install tilingshell@ferrarodomenico.com 2>/dev/null || true
+          fi
           
           gnome-extensions enable dash-to-dock@micxgx.gmail.com 2>/dev/null || true
           gnome-extensions enable tilingshell@ferrarodomenico.com 2>/dev/null || true
-EXT_EOF
-        fixed "GNOME extensions (Dash to Dock, Tiling Shell) installed and enabled"
 
-        # Установка иконки и курсоров MacTahoe напрямую из исходной структуры репозитория
-        info "Downloading and installing MacTahoe icons and cursors..."
+          # Compile schemas so gsettings can access Tiling Shell and other extension settings
+          mkdir -p "$HOME/.local/share/glib-2.0/schemas"
+          for ext_dir in "$HOME/.local/share/gnome-shell/extensions/"*; do
+              if [[ -d "$ext_dir/schemas" ]]; then
+                  cp -f "$ext_dir/schemas/"*.xml "$HOME/.local/share/glib-2.0/schemas/" 2>/dev/null || true
+              fi
+          done
+          glib-compile-schemas "$HOME/.local/share/glib-2.0/schemas" 2>/dev/null || true
+EXT_EOF
+        fixed "GNOME extensions checked/installed and schemas compiled"
+
+        # Установка иконки и курсоров MacTahoe (с проверкой их наличия)
+        info "Checking MacTahoe icons and cursors..."
         sudo -u "$REAL_USER" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$USER_UID/bus" bash << 'MACTAHOE_EOF'
           set -e
-          TMP_DIR=$(mktemp -d)
-          cd "$TMP_DIR"
+          if [[ ! -d "$HOME/.local/share/icons/MacTahoe" ]]; then
+              echo "          Downloading MacTahoe icon theme..."
+              TMP_DIR=$(mktemp -d)
+              cd "$TMP_DIR"
 
-          # Иконки
-          if curl -sL "https://github.com/vinceliuice/MacTahoe-icon-theme/archive/refs/heads/main.tar.gz" -o icon-theme.tar.gz; then
-              tar -xzf icon-theme.tar.gz
-              cd MacTahoe-icon-theme-main
-              # Устанавливаем иконки (по умолчанию в ~/.local/share/icons)
-              ./install.sh -d "$HOME/.local/share/icons" -n MacTahoe >/dev/null 2>&1 || ./install.sh >/dev/null 2>&1 || true
+              if curl -sL "https://github.com/vinceliuice/MacTahoe-icon-theme/archive/refs/heads/main.tar.gz" -o icon-theme.tar.gz; then
+                  tar -xzf icon-theme.tar.gz
+                  cd MacTahoe-icon-theme-main
+                  ./install.sh -d "$HOME/.local/share/icons" -n MacTahoe >/dev/null 2>&1 || ./install.sh >/dev/null 2>&1 || true
 
-              # Курсоры (подкаталог cursors)
-              if [[ -d cursors && -x cursors/install.sh ]]; then
-                  cd cursors
-                  ./install.sh >/dev/null 2>&1 || true
-                  cd ..
+                  if [[ -d cursors && -x cursors/install.sh ]]; then
+                      cd cursors
+                      ./install.sh >/dev/null 2>&1 || true
+                      cd ..
+                  fi
               fi
+              rm -rf "$TMP_DIR"
+          else
+              echo "          MacTahoe icons already exist, skipping download."
           fi
-          rm -rf "$TMP_DIR"
 
-          # Применяем темы
-          # Обычно после install.sh появляются MacTahoe и MacTahoe-cursors (или MacTahoe)
           if [[ -d "$HOME/.local/share/icons/MacTahoe" ]]; then
               gsettings set org.gnome.desktop.interface icon-theme "MacTahoe"
           elif [[ -d "$HOME/.icons/MacTahoe" ]]; then
               gsettings set org.gnome.desktop.interface icon-theme "MacTahoe"
           fi
 
-          # Курсор — ищем точное имя
           CURSOR_THEME=""
           for cand in "MacTahoe-cursors" "MacTahoe" "MacTahoe Cursors"; do
               if [[ -d "$HOME/.local/share/icons/$cand" || -d "$HOME/.icons/$cand" ]]; then
@@ -1223,7 +1237,6 @@ EXT_EOF
                   break
               fi
           done
-          # Запасной поиск
           if [[ -z "$CURSOR_THEME" ]]; then
               CURSOR_THEME=$(find "$HOME/.local/share/icons" "$HOME/.icons" -maxdepth 1 -type d \( -iname "*MacTahoe*cursor*" -o -iname "*MacTahoe*" \) 2>/dev/null | head -n1 | xargs -r basename || true)
           fi
@@ -1231,20 +1244,21 @@ EXT_EOF
               gsettings set org.gnome.desktop.interface cursor-theme "$CURSOR_THEME"
           fi
 MACTAHOE_EOF
-        fixed "MacTahoe icons and cursors installed and configured"
-
-        sudo -u "$REAL_USER" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$USER_UID/bus" bash << 'KB_EOF'
-  gsettings set org.gnome.desktop.input-sources xkb-options "['grp:shift_caps_toggle', 'grp:alt_shift_toggle']"
-KB_EOF
+        fixed "MacTahoe icons and cursors checked/configured"
 
         # Применение разметки для Tiling Shell (два монитора)
         info "Applying Tiling Shell multi-monitor layout configuration..."
         sudo -u "$REAL_USER" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$USER_UID/bus" bash << 'TILING_EOF'
           LAYOUT_JSON='[{"id":"13321385","tiles":[{"x":0,"y":0,"width":1,"height":0.3331766917293233,"groups":[2]},{"x":0,"y":0.3331766917293233,"width":1,"height":0.3336466165413534,"groups":[2,3]},{"x":0,"y":0.6668233082706767,"width":1,"height":0.33317669172932335,"groups":[3]}]},{"id":"13564581","tiles":[{"x":0,"y":0,"width":0.5,"height":1,"groups":[1]},{"x":0.5,"y":0,"width":0.49999999999999206,"height":1,"groups":[1]}]}]'
-          
-          # Проверяем наличие схемы tlingshell и записываем разметку
+
           if gsettings list-schemas | grep -q "org.gnome.shell.extensions.tilingshell"; then
-              gsettings set org.gnome.shell.extensions.tilingshell custom-layouts "$LAYOUT_JSON" 2>/dev/null || true
+              # Правильный ключ — layouts-json
+              gsettings set org.gnome.shell.extensions.tilingshell layouts-json "$LAYOUT_JSON" 2>/dev/null || true
+
+              # Активируем раскладки на мониторах (id из LAYOUT_JSON)
+              # Формат: массив массивов — по одному id на каждый монитор/workspace
+              gsettings set org.gnome.shell.extensions.tilingshell selected-layouts "[['13321385'], ['13564581']]" 2>/dev/null || \
+              gsettings set org.gnome.shell.extensions.tilingshell selected-layouts "[['13321385'],['13564581']]" 2>/dev/null || true
           fi
 TILING_EOF
         fixed "Tiling Shell multi-monitor layout applied successfully"
@@ -1255,56 +1269,51 @@ TILING_EOF
           flatpak_desktop_ids=$(sudo -u "$REAL_USER" flatpak list --app --columns=application 2>/dev/null | awk '{print $1".desktop"}' | tr '\n' ' ')
         fi
 
-        sudo -u "$REAL_USER" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$USER_UID/bus" bash << 'GNOME_EOF'
-          # 1. Определение правильного десктоп-файла для терминала и скрытие из Show Apps
-          TERMINAL_ID=""
-          for term_app in "org.gnome.Terminal.desktop" "org.fedoraproject.Console.desktop" "org.gnome.Console.desktop"; do
-              if [[ -f "/usr/share/applications/$term_app" ]] || [[ -f "$HOME/.local/share/applications/$term_app" ]]; then
-                  TERMINAL_ID="$term_app"
-                  break
-              fi
-          done
-          [[ -z "$TERMINAL_ID" ]] && TERMINAL_ID="org.gnome.Terminal.desktop"
+        # Fedora 44/45 + GNOME 47+: default is Ptyxis; keep older Console/Terminal as fallback
+        TERMINAL_ID=""
+        for term_app in \
+            "org.gnome.Ptyxis.desktop" \
+            "org.gnome.Console.desktop" \
+            "org.fedoraproject.Console.desktop" \
+            "org.gnome.Terminal.desktop"
+        do
+            if [[ -f "/usr/share/applications/$term_app" ]]; then
+                TERMINAL_ID="$term_app"
+                break
+            fi
+        done
+        [[ -z "$TERMINAL_ID" ]] && TERMINAL_ID="org.gnome.Ptyxis.desktop"
 
-          # Создаем локальный override для терминала, чтобы он исчез из Show Apps, но работал на панели
-          mkdir -p "$HOME/.local/share/applications"
-          if [[ -f "/usr/share/applications/$TERMINAL_ID" ]]; then
-              cp "/usr/share/applications/$TERMINAL_ID" "$HOME/.local/share/applications/$TERMINAL_ID"
-          elif [[ -f "$HOME/.local/share/applications/$TERMINAL_ID" ]]; then
-              true
-          else
-              echo "[Desktop Entry]" > "$HOME/.local/share/applications/$TERMINAL_ID"
-              echo "Type=Application" >> "$HOME/.local/share/applications/$TERMINAL_ID"
-          fi
-          if grep -q "^NoDisplay=" "$HOME/.local/share/applications/$TERMINAL_ID"; then
-              sed -i 's/^NoDisplay=.*/NoDisplay=true/' "$HOME/.local/share/applications/$TERMINAL_ID"
-          else
-              echo "NoDisplay=true" >> "$HOME/.local/share/applications/$TERMINAL_ID"
-          fi
+        base_favs=(
+            "org.gnome.Nautilus.desktop"
+            "org.mozilla.firefox.desktop"
+            "org.telegram.desktop.desktop"
+            "org.keepassxc.KeePassXC.desktop"
+            "org.filezillaproject.Filezilla.desktop"
+            "com.sublimehq.SublimeText.desktop"
+            "org.gimp.GIMP.desktop"
+            "org.gnome.Calculator.desktop"
+            "$TERMINAL_ID"
+            "com.github.wwmm.easyeffects.desktop"
+        )
 
-          # 2. Строгий порядок значков на панели по вашему списку:
-          base_favs=(
-              "org.gnome.Nautilus.desktop"
-              "org.mozilla.firefox.desktop"
-              "org.telegram.desktop.desktop"
-              "org.keepassxc.KeePassXC.desktop"
-              "org.filezillaproject.Filezilla.desktop"
-              "com.sublimehq.SublimeText.desktop"
-              "org.gimp.GIMP.desktop"
-              "org.gnome.Calculator.desktop"
-              "$TERMINAL_ID"
-              "com.github.wwmm.easyeffects.desktop"
-          )
+        fav_quoted=()
+        for app in "${base_favs[@]}"; do
+            fav_quoted+=("'$app'")
+        done
+        FAV_APPS="[$(IFS=,; echo "${fav_quoted[*]}")]"
 
-          # Применяем порядок значков на панели
-          fav_quoted=()
-          for app in "${base_favs[@]}"; do
-              fav_quoted+=("'$app'")
-          done
-          FAV_APPS="[$(IFS=,; echo "${fav_quoted[*]}")]"
+        # Передаём список избранных в subshell (quoted heredoc не видит host-массивы)
+        BASE_FAVS_STR="${base_favs[*]}"
+
+        sudo -u "$REAL_USER" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$USER_UID/bus" XDG_RUNTIME_DIR="/run/user/$USER_UID" \
+          FAV_APPS="$FAV_APPS" BASE_FAVS_STR="$BASE_FAVS_STR" bash << 'GNOME_EOF'
+          # Применяем проверенный список избранных приложений без создания "битых" локальных копий с именем unnamed
           gsettings set org.gnome.shell favorite-apps "$FAV_APPS"
 
           # 3. Формирование папки 'Default' (все остальные приложения, кроме закрепленных выше)
+          # shellcheck disable=SC2206
+          base_favs=( $BASE_FAVS_STR )
           app_list=()
           while IFS= read -r desktop_file; do
               skip=false
@@ -1357,6 +1366,132 @@ GNOME_EOF
   fi
 else
   info "GNOME layout & extensions configuration skipped (set SETUP_GNOME_LAYOUT=true to activate)"
+fi
+
+# ===========================================================================
+# 20. Recommended System Preferences (GNOME)
+# ===========================================================================
+section '20. Recommended System Preferences'
+
+if [[ "$SETUP_SYSTEM_PREFS" == true ]]; then
+  if [[ "$IS_DESKTOP" == true ]]; then
+    REAL_USER="${SUDO_USER:-$(logname 2>/dev/null || whoami)}"
+    if [[ "$REAL_USER" == "root" ]]; then
+      REAL_USER=$(awk -v tty="$(tty 2>/dev/null | sed 's|/dev/||')" '$2 == tty {print $1}' /proc/self/loginuid 2>/dev/null || true)
+      [[ -z "$REAL_USER" || "$REAL_USER" == "root" ]] && REAL_USER=$(users 2>/dev/null | awk '{print $1}')
+    fi
+    USER_UID=$(id -u "$REAL_USER" 2>/dev/null || echo 1000)
+
+    if [[ -n "$REAL_USER" && "$REAL_USER" != "root" ]]; then
+      info "Applying system preferences for user: $REAL_USER"
+
+      if [[ "$MODE" == "apply" ]]; then
+        # --- Power mode → Performance (works with both power-profiles-daemon and tuned-ppd) ---
+        # Fedora 41+ ships tuned-ppd by default; powerprofilesctl exists only with the real ppd package.
+        if command -v powerprofilesctl &>/dev/null; then
+          powerprofilesctl set performance 2>/dev/null || true
+        elif command -v tuned-adm &>/dev/null; then
+          # tuned-ppd maps "performance" → throughput-performance
+          tuned-adm profile throughput-performance 2>/dev/null || \
+          tuned-adm profile latency-performance 2>/dev/null || true
+        fi
+
+        sudo -u "$REAL_USER" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$USER_UID/bus" XDG_RUNTIME_DIR="/run/user/$USER_UID" bash << 'PREFS_EOF'
+          set +e
+
+          # --- Keyboard: English primary + Russian additional, hotkey Shift + Alt ---
+          gsettings set org.gnome.desktop.input-sources sources "[('xkb', 'us'), ('xkb', 'ru')]"
+          gsettings set org.gnome.desktop.input-sources xkb-options "['grp:alt_shift_toggle', 'grp:shift_caps_toggle']"
+
+          # --- Microphone input volume → 0 (with XDG_RUNTIME_DIR context) ---
+          export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+          if command -v pactl &>/dev/null; then
+            DEFAULT_SOURCE=$(pactl get-default-source 2>/dev/null || true)
+            if [[ -n "$DEFAULT_SOURCE" ]]; then
+              pactl set-source-volume "$DEFAULT_SOURCE" 0% 2>/dev/null || true
+              pactl set-source-mute "$DEFAULT_SOURCE" 1 2>/dev/null || true
+            fi
+            pactl list short sources 2>/dev/null | while read -r idx name rest; do
+              pactl set-source-volume "$idx" 0% 2>/dev/null || true
+              pactl set-source-mute "$idx" 1 2>/dev/null || true
+            done
+          fi
+
+          # --- Power mode → Performance (user-session fallback) ---
+          if command -v powerprofilesctl &>/dev/null; then
+            powerprofilesctl set performance 2>/dev/null || true
+          elif command -v tuned-adm &>/dev/null; then
+            tuned-adm profile throughput-performance 2>/dev/null || \
+            tuned-adm profile latency-performance 2>/dev/null || true
+          fi
+
+          # --- Blank screen / power saving: never ---
+          gsettings set org.gnome.desktop.session idle-delay 0
+          gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-ac-type 'nothing' 2>/dev/null || true
+          gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-battery-type 'nothing' 2>/dev/null || true
+          gsettings set org.gnome.settings-daemon.plugins.power idle-dim false 2>/dev/null || true
+
+          # --- Automatic screen lock: off ---
+          gsettings set org.gnome.desktop.screensaver lock-enabled false
+          gsettings set org.gnome.desktop.screensaver lock-delay 0
+
+          # --- Dynamic workspaces → fixed, count = 1 ---
+          gsettings set org.gnome.mutter dynamic-workspaces false
+          gsettings set org.gnome.desktop.wm.preferences num-workspaces 1
+
+          # --- Appearance: Dark ---
+          gsettings set org.gnome.desktop.interface color-scheme 'prefer-dark'
+          gsettings set org.gnome.desktop.interface gtk-theme 'Adwaita-dark' 2>/dev/null || true
+
+          # --- Lock Screen notifications: off ---
+          gsettings set org.gnome.desktop.notifications show-in-lock-screen false 2>/dev/null || true
+          gsettings set org.gnome.desktop.screensaver show-notifications false 2>/dev/null || true
+
+          # --- App Search in overview: off ---
+          gsettings set org.gnome.desktop.search-providers disable-external true 2>/dev/null || true
+          # Hide all providers if the key exists
+          if gsettings list-keys org.gnome.desktop.search-providers 2>/dev/null | grep -q disabled; then
+            CURRENT=$(gsettings get org.gnome.desktop.search-providers disabled 2>/dev/null || echo "[]")
+            # Leave as-is if already set; otherwise we just rely on disable-external
+            true
+          fi
+
+          # --- Location services: force off ---
+          gsettings set org.gnome.system.location enabled false
+
+          # --- File History: keep 30 days ---
+          gsettings set org.gnome.desktop.privacy remember-recent-files true
+          gsettings set org.gnome.desktop.privacy recent-files-max-age 30
+
+          # --- Automatically Empty Trash + Delete Temporary Files (30 days) ---
+          gsettings set org.gnome.desktop.privacy remove-old-trash-files true
+          gsettings set org.gnome.desktop.privacy remove-old-temp-files true
+          gsettings set org.gnome.desktop.privacy old-files-age 30
+
+          # --- Regional formats: Russian Federation, 24h, Monday first ---
+          # System language stays English; only formats become Russian
+          gsettings set org.gnome.system.locale region 'ru_RU.UTF-8' 2>/dev/null || true
+          gsettings set org.gnome.desktop.interface clock-format '24h'
+          gsettings set org.gnome.desktop.calendar week-start-day-name 'monday' 2>/dev/null || \
+            gsettings set org.gnome.desktop.calendar week-start-day 1 2>/dev/null || true
+
+          # --- Clock & Calendar: show seconds ---
+          gsettings set org.gnome.desktop.interface clock-show-seconds true
+          gsettings set org.gnome.desktop.interface clock-show-date true
+          gsettings set org.gnome.desktop.interface clock-show-weekday true 2>/dev/null || true
+PREFS_EOF
+        fixed "System preferences applied for user $REAL_USER"
+      else
+        info "Would apply system preferences for user $REAL_USER (mode: audit)"
+      fi
+    else
+      warn "Could not determine graphical user for system preferences."
+    fi
+  else
+    info "Graphical environment not detected, skipping system preferences."
+  fi
+else
+  info "System preferences skipped (set SETUP_SYSTEM_PREFS=true to activate)"
 fi
 
 # ===========================================================================
