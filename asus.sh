@@ -199,74 +199,172 @@ echo "[+] Generating /jffs/scripts/firewall-start..."
 cat << 'EOF' > /jffs/scripts/firewall-start
 #!/bin/sh
 
-# 1. Mandatory forwarding to WAN and back for all VLANs
-iptables -I FORWARD 1 -i br10 -o eth0 -j ACCEPT
-iptables -I FORWARD 1 -i eth0 -o br10 -j ACCEPT
+# ============================================================
+# Homelab VLAN firewall for ASUS-style router firmware
+#
+# br0  - Main LAN: 192.168.1.0/24
+# br10 - Trusted:  10.10.10.0/24
+# br20 - Servers:  10.10.20.0/24
+# br30 - IoT:      10.10.30.0/24
+# br40 - Guest:    10.10.40.0/24
+# eth0 - WAN
+#
+# This script does not flush system firewall tables,
+# change default policies, or modify system NAT rules.
+# ============================================================
 
-iptables -I FORWARD 1 -i br20 -o eth0 -j ACCEPT
-iptables -I FORWARD 1 -i eth0 -o br20 -j ACCEPT
+IPT="iptables"
+NAS_IP="10.10.10.10"
 
-iptables -I FORWARD 1 -i br30 -o eth0 -j ACCEPT
-iptables -I FORWARD 1 -i eth0 -o br30 -j ACCEPT
+# Locate a rule in a chain and return its iptables rule number.
+find_rule() {
+    "$IPT" -S "$1" | awk -v target="$2" '
+        BEGIN { n = 1 }
+        /^-A / {
+            if ($0 == target) {
+                print n
+                exit
+            }
+            n++
+        }
+    '
+}
 
-iptables -I FORWARD 1 -i br40 -o eth0 -j ACCEPT
-iptables -I FORWARD 1 -i eth0 -o br40 -j ACCEPT
+# Insert a jump before an existing system rule.
+insert_before() {
+    chain="$1"
+    target="$2"
+    jump="$3"
 
-# Admin Router/Switch access strictly from VLAN 10 (Trusted)
-iptables -I INPUT 1 -i br10 -p tcp --dport 80 -j ACCEPT
-iptables -I INPUT 1 -i br10 -p tcp --dport 443 -j ACCEPT
-iptables -I INPUT 1 -i br10 -p tcp --dport 22 -j ACCEPT
-iptables -I INPUT 1 -i br10 -p tcp --dport 4444 -j ACCEPT
+    pos=$(find_rule "$chain" "$target")
 
-# 2. NAT (Masquerade) for internet access across all subnets via WAN (eth0)
-iptables -t nat -A POSTROUTING -o eth0 -j MASQUERODE 2>/dev/null || iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+    if [ -z "$pos" ]; then
+        echo "ERROR: Anchor rule not found in $chain: $target" >&2
+        return 1
+    fi
 
-# 3. Unconditional permission for incoming DHCP and DNS from all bridges
-iptables -I INPUT 1 -p udp --dport 67:68 -j ACCEPT
-iptables -I INPUT 1 -p udp --sport 67:68 -j ACCEPT
-iptables -I INPUT 1 -p udp --dport 53 -j ACCEPT
-iptables -I INPUT 1 -p tcp --dport 53 -j ACCEPT
+    "$IPT" -I "$chain" "$pos" -j "$jump"
+}
 
-# 4. Allow WAN routing for remaining subnets
-iptables -A FORWARD -i br0 -o eth0 -j ACCEPT
-iptables -A FORWARD -i br20 -o eth0 -j ACCEPT
-iptables -A FORWARD -i br30 -o eth0 -j ACCEPT
-iptables -A FORWARD -i br40 -o eth0 -j ACCEPT
+# Create or refresh only our own chains.
+for chain in HOMELAB_INPUT HOMELAB_ISO HOMELAB_WAN; do
+    "$IPT" -N "$chain" 2>/dev/null || true
+    "$IPT" -F "$chain"
+done
 
-# 5. Trusted (VLAN 10) has access to all other segments and Management network
-iptables -A FORWARD -i br10 -o br0 -j ACCEPT
-iptables -A FORWARD -i br10 -o br20 -j ACCEPT
-iptables -A FORWARD -i br10 -o br30 -j ACCEPT
-iptables -A FORWARD -i br10 -o br40 -j ACCEPT
+# Remove our previous jump references to make reruns idempotent.
+while "$IPT" -D INPUT -j HOMELAB_INPUT 2>/dev/null; do :; done
+while "$IPT" -D FORWARD -j HOMELAB_ISO 2>/dev/null; do :; done
+while "$IPT" -D FORWARD -j HOMELAB_WAN 2>/dev/null; do :; done
 
-# 6. Allow responses to established connections
-iptables -A FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT
+# ------------------------------------------------------------
+# 1. INPUT: Access to the router itself.
+# ------------------------------------------------------------
 
-# 7. Segment isolation (inter-VLAN firewall barrier)
-iptables -A FORWARD -i br20 -o br10 -j DROP
-iptables -A FORWARD -i br20 -o br30 -j DROP
-iptables -A FORWARD -i br20 -o br40 -j DROP
+# Preserve loopback access.
+"$IPT" -A HOMELAB_INPUT -i lo -j RETURN
 
-iptables -A FORWARD -i br30 -o br0 -j DROP
-iptables -A FORWARD -i br30 -o br10 -j DROP
-iptables -A FORWARD -i br30 -o br20 -j DROP
-iptables -A FORWARD -i br30 -o br40 -j DROP
+# Allow DHCP requests from local networks.
+for iface in br0 br10 br20 br30 br40; do
+    "$IPT" -A HOMELAB_INPUT -i "$iface" \
+        -p udp --dport 67 -j ACCEPT
+done
 
-iptables -A FORWARD -i br40 -o br0 -j DROP
-iptables -A FORWARD -i br40 -o br10 -j DROP
-iptables -A FORWARD -i br40 -o br20 -j DROP
-iptables -A FORWARD -i br40 -o br30 -j DROP
+# Allow DNS requests from local networks.
+for iface in br0 br10 br20 br30 br40; do
+    "$IPT" -A HOMELAB_INPUT -i "$iface" \
+        -p udp --dport 53 -j ACCEPT
 
-# 8. Protect router management interface from IoT (VLAN 30) and Guest (VLAN 40)
-iptables -A INPUT -i br30 -p tcp --dport 80 -j DROP
-iptables -A INPUT -i br30 -p tcp --dport 443 -j DROP
-iptables -A INPUT -i br30 -p tcp --dport 22 -j DROP
-iptables -A INPUT -i br30 -p tcp --dport 4444 -j DROP
+    "$IPT" -A HOMELAB_INPUT -i "$iface" \
+        -p tcp --dport 53 -j ACCEPT
+done
 
-iptables -A INPUT -i br40 -p tcp --dport 80 -j DROP
-iptables -A INPUT -i br40 -p tcp --dport 443 -j DROP
-iptables -A INPUT -i br40 -p tcp --dport 22 -j DROP
-iptables -A INPUT -i br40 -p tcp --dport 4444 -j DROP
+# Allow management access only from Trusted VLAN.
+for port in 22 80 443 4444; do
+    "$IPT" -A HOMELAB_INPUT -i br10 \
+        -p tcp --dport "$port" -j ACCEPT
+done
+
+# Block router management ports from every other interface.
+for port in 22 80 443 4444; do
+    "$IPT" -A HOMELAB_INPUT \
+        -p tcp --dport "$port" -j DROP
+done
+
+# Leave unrelated router traffic to the existing firewall.
+"$IPT" -A HOMELAB_INPUT -j RETURN
+
+# ------------------------------------------------------------
+# 2. FORWARD: Inter-VLAN isolation.
+# ------------------------------------------------------------
+
+# Prevent new routed connections to IoT and Guest VLANs,
+# including connections created by port forwarding.
+"$IPT" -A HOMELAB_ISO -o br30 -j DROP
+"$IPT" -A HOMELAB_ISO -o br40 -j DROP
+
+# IoT and Guest may not initiate connections outside their VLANs,
+# except connections directed to the WAN.
+"$IPT" -A HOMELAB_ISO -i br30 ! -o eth0 -j DROP
+"$IPT" -A HOMELAB_ISO -i br40 ! -o eth0 -j DROP
+
+# Allow Trusted VLAN to reach the main LAN.
+"$IPT" -A HOMELAB_ISO -i br10 -o br0 -j ACCEPT
+
+# Allow Trusted VLAN to access selected Servers VLAN services.
+for port in 22 4444 11434; do
+    "$IPT" -A HOMELAB_ISO -i br10 -o br20 \
+        -p tcp --dport "$port" -j ACCEPT
+done
+
+# Allow Servers VLAN to access the NAS using NFSv4.
+# Enable this rule only if the Proxmox host actually exports NFS.
+"$IPT" -A HOMELAB_ISO -i br20 -o br10 \
+    -d "$NAS_IP" -p tcp --dport 2049 -j ACCEPT
+
+# Block all other new connections between Trusted and Servers.
+"$IPT" -A HOMELAB_ISO -i br10 -o br20 -j DROP
+"$IPT" -A HOMELAB_ISO -i br20 -o br10 -j DROP
+
+# Block all other routed traffic between bridge interfaces.
+"$IPT" -A HOMELAB_ISO -i br+ -o br+ -j DROP
+
+# Preserve traffic not covered by the homelab policy.
+"$IPT" -A HOMELAB_ISO -j RETURN
+
+# ------------------------------------------------------------
+# 3. FORWARD: Internet access for VLANs.
+# ------------------------------------------------------------
+
+# Allow outbound Internet access from each VLAN.
+# System VPN chains are evaluated before this chain.
+for iface in br10 br20 br30 br40; do
+    "$IPT" -A HOMELAB_WAN -i "$iface" -o eth0 -j ACCEPT
+done
+
+# Preserve the existing firewall for all other traffic.
+"$IPT" -A HOMELAB_WAN -j RETURN
+
+# ------------------------------------------------------------
+# 4. Install hooks without resetting system firewall rules.
+# ------------------------------------------------------------
+
+# Apply router access restrictions before the vendor service rules.
+insert_before INPUT \
+    "-A INPUT ! -i br0 -j PTCSRVWAN" \
+    HOMELAB_INPUT || exit 1
+
+# Apply VLAN isolation before the existing DNAT acceptance rule.
+insert_before FORWARD \
+    "-A FORWARD -m conntrack --ctstate DNAT -j logaccept" \
+    HOMELAB_ISO || exit 1
+
+# Apply VLAN Internet permissions before the SDN forwarding rules.
+insert_before FORWARD \
+    "-A FORWARD -j SDN_FF" \
+    HOMELAB_WAN || exit 1
+
+echo "Homelab VLAN firewall rules installed."
 
 EOF
 chmod +x /jffs/scripts/firewall-start
