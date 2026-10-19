@@ -1,8 +1,8 @@
 #!/bin/sh
 
-echo "=================================================="
-echo " Starting Ultra-Hardened Network Setup (Zero Trust)"
-echo "=================================================="
+echo "============================================="
+echo " Starting Hardened Network Setup (Zero Trust)"
+echo "============================================="
 
 # 1. Enable JFFS script support in NVRAM
 nvram set jffs2_scripts=1
@@ -199,20 +199,6 @@ echo "[+] Generating /jffs/scripts/firewall-start..."
 cat << 'EOF' > /jffs/scripts/firewall-start
 #!/bin/sh
 
-# ============================================================
-# Homelab VLAN firewall for ASUS-style router firmware
-#
-# br0  - Main LAN: 192.168.1.0/24
-# br10 - Trusted:  10.10.10.0/24
-# br20 - Servers:  10.10.20.0/24
-# br30 - IoT:      10.10.30.0/24
-# br40 - Guest:    10.10.40.0/24
-# eth0 - WAN
-#
-# This script does not flush system firewall tables,
-# change default policies, or modify system NAT rules.
-# ============================================================
-
 IPT="iptables"
 NAS_IP="10.10.10.10"
 
@@ -306,23 +292,26 @@ done
 # IoT and Guest may not initiate connections outside their VLANs,
 # except connections directed to the WAN.
 "$IPT" -A HOMELAB_ISO -i br30 ! -o eth0 -j DROP
+"$IPT" -A HOMELAB_ISO -i br30 ! -o eth1 -j DROP
+
 "$IPT" -A HOMELAB_ISO -i br40 ! -o eth0 -j DROP
+"$IPT" -A HOMELAB_ISO -i br40 ! -o eth1 -j DROP
 
 # Allow Trusted VLAN to reach the main LAN.
 "$IPT" -A HOMELAB_ISO -i br10 -o br0 -j ACCEPT
 
-# Allow Trusted VLAN to access selected Servers VLAN services.
+# Allow Trusted VLAN to access selected SemiTrusted VLAN services.
 for port in 22 4444 11434; do
     "$IPT" -A HOMELAB_ISO -i br10 -o br20 \
         -p tcp --dport "$port" -j ACCEPT
 done
 
-# Allow Servers VLAN to access the NAS using NFSv4.
+# Allow SemiTrusted VLAN to access the NAS using NFSv4.
 # Enable this rule only if the Proxmox host actually exports NFS.
 "$IPT" -A HOMELAB_ISO -i br20 -o br10 \
     -d "$NAS_IP" -p tcp --dport 2049 -j ACCEPT
 
-# Block all other new connections between Trusted and Servers.
+# Block all other new connections between Trusted and SemiTrusted.
 "$IPT" -A HOMELAB_ISO -i br10 -o br20 -j DROP
 "$IPT" -A HOMELAB_ISO -i br20 -o br10 -j DROP
 
@@ -340,6 +329,7 @@ done
 # System VPN chains are evaluated before this chain.
 for iface in br10 br20 br30 br40; do
     "$IPT" -A HOMELAB_WAN -i "$iface" -o eth0 -j ACCEPT
+    "$IPT" -A HOMELAB_WAN -i "$iface" -o eth1 -j ACCEPT
 done
 
 # Preserve the existing firewall for all other traffic.
