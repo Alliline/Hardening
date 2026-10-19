@@ -46,6 +46,7 @@ nvram set avahi_enable=0
 nvram set wsdd2_enable=0
 nvram set lldpd_enable=0
 nvram set bt_enable=0
+nvram set aae_enable=0
 nvram set feedback_enable=0
 nvram set uptime_enable=0
 nvram set nat_autofw_enable=0
@@ -56,6 +57,7 @@ nvram set cloud_sync=0
 nvram set apps_enable=0
 nvram set networkmap_enable=0
 nvram set conn_diag_enable=0
+nvram set reaper_wanbounce_enable=0
 
 # Save settings to NVRAM
 nvram commit
@@ -104,6 +106,7 @@ UNWANTED_MODULES="
   ah4
   esp4
   ipcomp
+  proxysta
   xfrm4_tunnel
   xfrm_user
   ax88179_178a
