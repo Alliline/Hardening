@@ -1,13 +1,13 @@
 #!/bin/sh
 
 echo "=================================================="
-echo " Starting Hardened Network Setup (Zero Trust)"
+echo " Starting Ultra-Hardened Network Setup (Zero Trust)"
 echo "=================================================="
 
 # 1. Enable JFFS script support in NVRAM
 nvram set jffs2_scripts=1
 
-# 2. Hardening: Total shutdown of USB, modems, and file services
+# 2. Hardening: Total shutdown of USB, modems, file services, WPS & IPv6
 nvram set modem_enable=0
 nvram set usb_modem_act=0
 nvram set enable_ftp=0
@@ -15,6 +15,17 @@ nvram set enable_samba=0
 nvram set dms_enable=0
 nvram set afpd_enable=0
 nvram set irdmi_enable=0
+
+# Disable WPS completely
+nvram set wps_enable=0
+nvram set wps_enable_x=0
+nvram set wl_wps_mode=disabled
+nvram set wl0_wps_mode=disabled
+nvram set wl1_wps_mode=disabled
+
+# Disable IPv6 to prevent IPv6 leaks across VLANs (if not explicitly used)
+nvram set ipv6_service=disabled
+nvram set ipv6_enable=0
 
 # 3. Hardening: Disable all VPNs, Tor, and tunnels
 nvram set vpn_server1_enable=0
@@ -43,12 +54,14 @@ nvram set cfg_server=0
 nvram set snmp_enable=0
 nvram set cloud_sync=0
 nvram set apps_enable=0
+nvram set networkmap_enable=0
+nvram set conn_diag_enable=0
 
 # Save settings to NVRAM
 nvram commit
 
 # 5. Force kill daemon processes on the fly
-killall -9 tor openvpn charon swanctl l2tpd pptpd 2>/dev/null
+killall -9 tor openvpn charon swanctl l2tpd pptpd networkmap infosvr conn_diag asusdiscovery 2>/dev/null
 killall -9 smbd nmbd vsftpd minidlna afpd avahi-daemon wsdd2 miniupnpd lldpd snmpd ookla wg 2>/dev/null
 
 # Create script directory
@@ -63,7 +76,16 @@ cat << 'EOF' > /jffs/scripts/services-start
 
 sleep 3
 
-# --- Hardening: Aggressive unloading of unused and vulnerable kernel modules ---
+# --- Sysctl Network Hardening (Anti-Spoofing & Redirects) ---
+echo 1 > /proc/sys/net/ipv4/conf/all/rp_filter
+echo 1 > /proc/sys/net/ipv4/conf/default/rp_filter
+echo 0 > /proc/sys/net/ipv4/conf/all/accept_redirects
+echo 0 > /proc/sys/net/ipv4/conf/all/send_redirects
+echo 0 > /proc/sys/net/ipv4/conf/all/accept_source_route
+echo 1 > /proc/sys/net/ipv4/icmp_echo_ignore_broadcasts
+echo 1 > /proc/sys/net/ipv4/tcp_syncookies
+
+# --- Hardening: Aggressive unloading of unused kernel modules ---
 UNWANTED_MODULES="
   cifs
   xt_sctp
@@ -94,10 +116,13 @@ UNWANTED_MODULES="
   nf_nat_ftp
 "
 
-for mod in $UNWANTED_MODULES; do
-    if lsmod | grep -q "^$mod "; then
-        rmmod "$mod" 2>/dev/null
-    fi
+for i in 1 2; do
+    for mod in $UNWANTED_MODULES; do
+        if lsmod | grep -q "^$mod "; then
+            rmmod "$mod" 2>/dev/null
+        fi
+    done
+    sleep 1
 done
 
 # --- 1. Cleanup old VLAN interfaces and bridges ---
@@ -171,28 +196,27 @@ echo "[+] Generating /jffs/scripts/firewall-start..."
 cat << 'EOF' > /jffs/scripts/firewall-start
 #!/bin/sh
 
-# 1. Mandatory forwarding to WAN and back
-# 1.1 VLAN 10 (Trusted)
+# 1. Mandatory forwarding to WAN and back for all VLANs
 iptables -I FORWARD 1 -i br10 -o eth0 -j ACCEPT
 iptables -I FORWARD 1 -i eth0 -o br10 -j ACCEPT
-# 1.2 VLAN 20 (SemiTrusted)
+
 iptables -I FORWARD 1 -i br20 -o eth0 -j ACCEPT
 iptables -I FORWARD 1 -i eth0 -o br20 -j ACCEPT
-# 1.3 VLAN 30 (IoT)
+
 iptables -I FORWARD 1 -i br30 -o eth0 -j ACCEPT
 iptables -I FORWARD 1 -i eth0 -o br30 -j ACCEPT
-# 1.4 VLAN 40 (Guest)
+
 iptables -I FORWARD 1 -i br40 -o eth0 -j ACCEPT
 iptables -I FORWARD 1 -i eth0 -o br40 -j ACCEPT
 
-# Admin Router/Switch for VLAN 10 (Trusted)
+# Admin Router/Switch access strictly from VLAN 10 (Trusted)
 iptables -I INPUT 1 -i br10 -p tcp --dport 80 -j ACCEPT
 iptables -I INPUT 1 -i br10 -p tcp --dport 443 -j ACCEPT
 iptables -I INPUT 1 -i br10 -p tcp --dport 22 -j ACCEPT
-iptables -I INPUT 1 -i br10 -p tcp --dport 4444 -j ACCEPT # Alt SSH
+iptables -I INPUT 1 -i br10 -p tcp --dport 4444 -j ACCEPT
 
 # 2. NAT (Masquerade) for internet access across all subnets via WAN (eth0)
-iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+iptables -t nat -A POSTROUTING -o eth0 -j MASQUERODE 2>/dev/null || iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
 
 # 3. Unconditional permission for incoming DHCP and DNS from all bridges
 iptables -I INPUT 1 -p udp --dport 67:68 -j ACCEPT
@@ -253,5 +277,5 @@ echo "[+] Applying scripts and restarting services..."
 service restart_dnsmasq
 
 echo "=================================================="
-echo " Hardened Setup Completed Successfully!"
+echo " Ultra-Hardened Setup Completed Successfully!"
 echo "=================================================="
