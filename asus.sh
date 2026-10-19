@@ -234,10 +234,12 @@ iptables -A FORWARD -i br40 -o br30 -j DROP
 iptables -A INPUT -i br30 -p tcp --dport 80 -j DROP
 iptables -A INPUT -i br30 -p tcp --dport 443 -j DROP
 iptables -A INPUT -i br30 -p tcp --dport 22 -j DROP
+iptables -A INPUT -i br30 -p tcp --dport 4444 -j DROP
 
 iptables -A INPUT -i br40 -p tcp --dport 80 -j DROP
 iptables -A INPUT -i br40 -p tcp --dport 443 -j DROP
 iptables -A INPUT -i br40 -p tcp --dport 22 -j DROP
+iptables -A INPUT -i br40 -p tcp --dport 4444 -j DROP
 
 EOF
 chmod +x /jffs/scripts/firewall-start
