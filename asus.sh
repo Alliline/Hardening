@@ -171,9 +171,25 @@ echo "[+] Generating /jffs/scripts/firewall-start..."
 cat << 'EOF' > /jffs/scripts/firewall-start
 #!/bin/sh
 
-# 1. Mandatory forwarding for VLAN 10 (Trusted) to WAN and back
+# 1. Mandatory forwarding to WAN and back
+# 1.1 VLAN 10 (Trusted)
 iptables -I FORWARD 1 -i br10 -o eth0 -j ACCEPT
 iptables -I FORWARD 1 -i eth0 -o br10 -j ACCEPT
+# 1.2 VLAN 20 (SemiTrusted)
+iptables -I FORWARD 1 -i br20 -o eth0 -j ACCEPT
+iptables -I FORWARD 1 -i eth0 -o br20 -j ACCEPT
+# 1.3 VLAN 30 (IoT)
+iptables -I FORWARD 1 -i br30 -o eth0 -j ACCEPT
+iptables -I FORWARD 1 -i eth0 -o br30 -j ACCEPT
+# 1.4 VLAN 40 (Guest)
+iptables -I FORWARD 1 -i br40 -o eth0 -j ACCEPT
+iptables -I FORWARD 1 -i eth0 -o br40 -j ACCEPT
+
+# Admin Router/Switch for VLAN 10 (Trusted)
+iptables -I INPUT 1 -i br10 -p tcp --dport 80 -j ACCEPT
+iptables -I INPUT 1 -i br10 -p tcp --dport 443 -j ACCEPT
+iptables -I INPUT 1 -i br10 -p tcp --dport 22 -j ACCEPT
+iptables -I INPUT 1 -i br10 -p tcp --dport 4444 -j ACCEPT # Alt SSH
 
 # 2. NAT (Masquerade) for internet access across all subnets via WAN (eth0)
 iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
