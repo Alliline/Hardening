@@ -41,7 +41,7 @@ chmod +x ./cloudpanel.sh
 ./cloudpanel.sh
 ```
 - Отключение веб-доступа к панели (clp-nginx) и отдельного сервиса PHP (clp-php-fpm).
-- Временный фикс для полного избавления от PHP 8.1, на котором работает сама панель (сопутствие лечению CVE-2026-109618 и CVE-2026-109619)
+- Временный фикс для избавления от PHP 8.1, на котором работает сама панель (сопутствие лечению CVE-2026-109618 и CVE-2026-109619)
 - Когда переход на 8.5.12 уже состоялся и другие версии не нужны, желательно также:
 ```
 systemctl stop php7.1-fpm php7.2-fpm php7.3-fpm php7.4-fpm php8.0-fpm php8.1-fpm php8.2-fpm php8.3-fpm php8.4-fpm
@@ -53,3 +53,4 @@ systemctl is-enabled clp-nginx clp-php-fpm
 ps -eo pid,args | grep -E '[p]hp-fpm|[p]hp-cgi'
 grep -RInE 'fastcgi_pass|proxy_pass|8443|php-fpm' /etc/nginx /home/clp/services/nginx 2>/dev/null
 ```
+- Протестировано 21.10.2026 на 2.5.4.
