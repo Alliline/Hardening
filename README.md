@@ -25,6 +25,10 @@ Set-ExecutionPolicy Unrestricted -Scope Process -Force
 ```
 - Парсит лежащие рядом authorized_keys или id_rsa.pub, добавляет в разрешенные (для авторизации по SSH) ключи. 
 - Протестировано: 18.10.2026 на Windows 25H2 (26200.9711).
+- Повторный запуск при ошибке привелегий:
+```
+powershell.exe -ExecutionPolicy Bypass -File "C:\windows.ps1" -Mode Apply
+```
 
 ## Router: Asus BQ16
 ```
