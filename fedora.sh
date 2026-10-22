@@ -908,6 +908,7 @@ dnf_apps=(
 declare -A flatpak_apps=(
   [flatseal]="com.github.tchx84.Flatseal"
   [firefox]="org.mozilla.firefox"
+  [chromium]="org.chromium.Chromium"
   [filezilla]="org.filezillaproject.Filezilla"
   [keepassxc]="org.keepassxc.KeePassXC"
   [telegram]="org.telegram.desktop"
@@ -1287,6 +1288,7 @@ TILING_EOF
         base_favs=(
             "org.gnome.Nautilus.desktop"
             "org.mozilla.firefox.desktop"
+            "org.chromium.Chromium.desktop"
             "org.telegram.desktop.desktop"
             "org.keepassxc.KeePassXC.desktop"
             "org.filezillaproject.Filezilla.desktop"
