@@ -3,7 +3,7 @@
 ## PC: Fedora 44/45
 ```
 chmod +x ./fedora.sh
-sudo ./fedora.sh --apply
+sudo ./fedora.sh [--audit|--apply]
 ```
 - Удаляет весь мусор Gnome, повышает безопасность системы.
 - Опционально: установка ПО flatpak; hardened_malloc как в GrapheneOS для flatpak; персонализация (иконки, курсор, черная заливка на обои).
@@ -12,7 +12,7 @@ sudo ./fedora.sh --apply
 ## PC: DNS (Fedora)
 ```
 chmod +x ./wds.sh
-sudo ./wds.sh --apply
+sudo ./wds.sh [apply|update|status|restore]
 ```
 - Настраивает и включает локальный DNS, минимизирует вероятность слива IP адреса, снижает вероятность трекинга. 
 - Парсит лежащий рядом whitelist.txt - список разрешённых доменов. Заполнение в столбик, каждый с новой строки. 
@@ -21,7 +21,7 @@ sudo ./wds.sh --apply
 ## PC: Windows 11 PowerShell
 ```
 Set-ExecutionPolicy Unrestricted -Scope Process -Force
-.\windows.ps1 -Mode Apply
+.\windows.ps1 -Mode [Audit|Apply]
 ```
 - Удаляет дефолтное ПО Microsoft, повышает безопасность системы.
 - Парсит лежащие рядом authorized_keys или id_rsa.pub, добавляет в разрешенные (для авторизации по SSH) ключи. 
@@ -34,7 +34,7 @@ powershell.exe -ExecutionPolicy Bypass -File "C:\windows.ps1" -Mode Apply
 ## Router: Asus BQ16
 ```
 chmod +x ./asus.sh
-./asus.sh
+./asus.sh 
 ```
 - Настраивает VLAN на eth2 (порт LAN 10G) + фаервол + маскарадинг, отключает лишние сервисы.
 - Для прошивки AM-Reaper (которая отчасти Asus-Merlin). 
@@ -43,7 +43,7 @@ chmod +x ./asus.sh
 ## Web: Cloudpanel
 ```
 chmod +x ./cloudpanel.sh
-./cloudpanel.sh
+./cloudpanel.sh [enable|disable]
 ```
 - Отключение веб-доступа к панели (clp-nginx) и отдельного сервиса PHP (clp-php-fpm).
 - Временный фикс для избавления от PHP 8.1, на котором работает сама панель (сопутствие лечению CVE-2026-109618 и CVE-2026-109619)
