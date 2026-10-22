@@ -59,11 +59,15 @@ nvram set networkmap_enable=0
 nvram set conn_diag_enable=0
 nvram set reaper_wanbounce_enable=0
 
+# 5. Disable Web Control Panel
+nvram set http_enable=0
+nvram set https_enable=0
+
 # Save settings to NVRAM
 nvram commit
 
 # 5. Force kill daemon processes on the fly
-killall -9 tor openvpn charon swanctl l2tpd pptpd networkmap infosvr conn_diag asusdiscovery 2>/dev/null
+killall -9 httpd tor openvpn charon swanctl l2tpd pptpd networkmap infosvr conn_diag asusdiscovery 2>/dev/null
 killall -9 smbd nmbd vsftpd minidlna afpd avahi-daemon wsdd2 miniupnpd lldpd snmpd ookla wg 2>/dev/null
 
 # Create script directory
