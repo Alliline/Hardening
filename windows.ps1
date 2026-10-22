@@ -9,6 +9,8 @@
         .\windows.ps1 -Mode Audit
         .\windows.ps1 -Mode Apply -SSHPort 2222 -AllowedLocalSubnet "192.168.1.0/24"
         .\windows.ps1 -Mode Apply -CreateRestorePoint
+    Effective usage (skip policy error):
+    powershell.exe -ExecutionPolicy Bypass -File "C:\windows.ps1" -Mode Apply
 #>
 
 #Requires -RunAsAdministrator
@@ -20,10 +22,10 @@ param(
     [string]$Mode = 'Apply',
 
     [Parameter()]
-    [int]$SSHPort = 2222,
+    [int]$SSHPort = 4444,
 
     [Parameter()]
-    [string]$AllowedLocalSubnet = "192.168.1.0/24",
+    [string]$AllowedLocalSubnet = "10.10.10.0/24",
 
     [Parameter()]
     [switch]$CreateRestorePoint
@@ -556,7 +558,7 @@ if ($Mode -eq 'Apply') {
 
     Set-RegistryValue -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging" -Name "EnableScriptBlockLogging" -Value 1
     Set-RegistryValue -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell" -Name "EnableScripts" -Value 1
-    Set-RegistryValue -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell" -Name "ExecutionPolicy" -Value "AllSigned" -Type String
+    Set-RegistryValue -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell" -Name "ExecutionPolicy" -Value "RemoteSigned" -Type String
     Set-RegistryValue -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell" -Name "EnableModuleLogging" -Value 1
     Set-RegistryValue -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell" -Name "EnableTranscripting" -Value 1
 
@@ -777,10 +779,80 @@ if ($Mode -eq 'Apply') {
         Write-Log "sshd_config not found at $SSHDConfigPath" "WARN"
     }
 
-    Get-NetFirewallRule -DisplayName "SSH-Custom-Port-Local" -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue
+        Get-NetFirewallRule -DisplayName "SSH-Custom-Port-Local" -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue
     New-NetFirewallRule -DisplayName "SSH-Custom-Port-Local" -Direction Inbound -Protocol TCP `
         -LocalPort $SSHPort -RemoteAddress $AllowedLocalSubnet -Action Allow -Profile Any -Confirm:$false | Out-Null
     Write-Log "Firewall rule: SSH $SSHPort only from $AllowedLocalSubnet" "APPLIED"
+
+    # --- 8.1. Auto-import SSH public keys from script folder (admin-aware) ---
+    $ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
+    if (-not $ScriptDir) { $ScriptDir = (Get-Location).Path }
+
+    $KeySources = @(
+        (Join-Path $ScriptDir 'id_rsa.pub'),
+        (Join-Path $ScriptDir 'authorized_keys')
+    ) | Where-Object { Test-Path -LiteralPath $_ }
+
+    $IncomingKeys = @()
+    foreach ($src in $KeySources) {
+        foreach ($line in (Get-Content -LiteralPath $src -ErrorAction SilentlyContinue)) {
+            $t = $line.Trim()
+            if (-not $t -or $t.StartsWith('#')) { continue }
+            $p = $t -split '\s+', 3
+            if ($p.Count -ge 2 -and $p[0] -match '^(ssh-|ecdsa-|sk-)') {
+                $IncomingKeys += [pscustomobject]@{ Raw = $t; KeyId = "$($p[0]) $($p[1])" }
+            }
+        }
+    }
+
+    if ($IncomingKeys.Count -gt 0) {
+        # Определяем, является ли текущий пользователь администратором
+        $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+        $TargetFiles = if ($isAdmin) {
+            @("$env:ProgramData\ssh\administrators_authorized_keys")
+        } else {
+            @("$env:USERPROFILE\.ssh\authorized_keys")
+        }
+
+        # Собираем уже существующие ключи ТОЛЬКО из целевых файлов
+        $ExistingKeyIds = @{}
+        foreach ($tf in $TargetFiles) {
+            if (Test-Path -LiteralPath $tf) {
+                foreach ($line in (Get-Content -LiteralPath $tf -ErrorAction SilentlyContinue)) {
+                    $t = $line.Trim()
+                    if (-not $t -or $t.StartsWith('#')) { continue }
+                    $p = $t -split '\s+', 3
+                    if ($p.Count -ge 2) { $ExistingKeyIds["$($p[0]) $($p[1])"] = $true }
+                }
+            }
+        }
+
+        $NewKeys = @($IncomingKeys | Where-Object { -not $ExistingKeyIds.ContainsKey($_.KeyId) } | Sort-Object KeyId -Unique)
+
+        if ($NewKeys.Count -eq 0) {
+            Write-Log "SSH: all keys from script folder are already authorized in $($TargetFiles -join ', ')." "OK"
+        } else {
+            foreach ($tf in $TargetFiles) {
+                $dir = Split-Path -Parent $tf
+                if (-not (Test-Path -LiteralPath $dir)) { New-Item -Path $dir -ItemType Directory -Force | Out-Null }
+                $existing = @(Get-Content -LiteralPath $tf -ErrorAction SilentlyContinue)
+                $addLines = @($NewKeys | ForEach-Object { $_.Raw })
+                $content  = ((@($existing) + $addLines) -join "`r`n").TrimEnd() + "`r`n"
+                [System.IO.File]::WriteAllText($tf, $content, [System.Text.UTF8Encoding]::new($false))
+                Write-Log "SSH: added $($NewKeys.Count) key(s) to $tf" "APPLIED"
+            }
+            # Если писали в административный файл — сразу чиним ACL
+            $AdmKeys = "$env:ProgramData\ssh\administrators_authorized_keys"
+            if ($TargetFiles -contains $AdmKeys -and (Test-Path -LiteralPath $AdmKeys)) {
+                & icacls.exe $AdmKeys /inheritance:r 2>$null | Out-Null
+                & icacls.exe $AdmKeys /grant "*S-1-5-32-544:F" "*S-1-5-18:F" 2>$null | Out-Null
+                & icacls.exe $AdmKeys /remove "*S-1-5-32-545" "*S-1-5-11" "*S-1-1-0" 2>$null | Out-Null
+            }
+        }
+    } else {
+        Write-Log "SSH: no id_rsa.pub / authorized_keys next to script. Skipping key import." "OK"
+    }
 } else {
     Write-Log "OpenSSH would be configured on port $SSHPort" "AUDIT"
 }
