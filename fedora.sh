@@ -17,12 +17,12 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-VERSION='1.6'
+VERSION='2.0'
 MODE='audit'
 FORCE_SSH_KEEP=true          # set to false if you really want to remove SSH from public zone
 AGGRESSIVE_USERNS=false      # set to true to disable unprivileged user namespaces (breaks Flatpak/Podman rootless)
 
-# Интерактивные параметры (будут запрошены в режиме apply)
+# Interactive parameters (asked only in --apply mode)
 PURGE_GNOME_BLOAT=false
 INSTALL_OPTIONAL_SOFTWARE=false
 INSTALL_HARDENED_MALLOC=false
@@ -42,7 +42,7 @@ ask_yn() {
   fi
   local hint="Y/n"
   [[ "$default_val" =~ ^[nN]$ ]] && hint="y/N"
-  read -rp "$prompt_msg [$hint]: " ans
+  read -rp "$prompt_msg [$hint]: " ans || ans="$default_val"
   ans="${ans:-$default_val}"
   [[ "$ans" =~ ^[yY][eE]?[sS]?$ ]]
 }
@@ -151,6 +151,664 @@ write_managed() {
   install -o root -g root -m "$mode" "$tmp" "$dest"
   rm -f "$tmp"
   fixed "Updated: $dest"
+}
+
+# Resolve the real (non-root) user who invoked sudo
+resolve_real_user() {
+  local u="${SUDO_USER:-$(logname 2>/dev/null || true)}"
+  if [[ -z "$u" || "$u" == "root" ]]; then
+    u=$(awk -v tty="$(tty 2>/dev/null | sed 's|/dev/||')" '$2 == tty {print $1}' /proc/self/loginuid 2>/dev/null || true)
+  fi
+  if [[ -z "$u" || "$u" == "root" ]]; then
+    u=$(users 2>/dev/null | awk '{print $1}')
+  fi
+  echo "${u:-}"
+}
+
+setup_sublime_text() {
+  local real_user="${1:-$REAL_USER}"
+  local user_home="${2:-$USER_HOME}"
+  
+  if [[ -z "$user_home" || ! -d "$user_home" ]]; then
+    warn "User home directory not found for Sublime Text configuration."
+    return
+  fi
+
+  info "Configuring Sublime Text for user $real_user (Flatpak sandbox compatible)..."
+
+  local st_dirs=()
+  if [[ -d "$user_home/.var/app/com.sublimehq.SublimeText/config/sublime-text" ]]; then
+    st_dirs+=("$user_home/.var/app/com.sublimehq.SublimeText/config/sublime-text")
+  fi
+  if [[ -d "$user_home/.config/sublime-text" ]]; then
+    st_dirs+=("$user_home/.config/sublime-text")
+  fi
+  if [[ ${#st_dirs[@]} -eq 0 ]]; then
+    st_dirs+=("$user_home/.config/sublime-text")
+  fi
+
+  for st_config_dir in "${st_dirs[@]}"; do
+    local st_installed_pkg_dir="$st_config_dir/Installed Packages"
+    local st_user_pkg_dir="$st_config_dir/Packages/User"
+    local st_packages_dir="$st_config_dir/Packages"
+
+    sudo -u "$real_user" mkdir -p "$st_installed_pkg_dir" "$st_user_pkg_dir" "$st_packages_dir"
+
+    local pc_file="$st_installed_pkg_dir/Package Control.sublime-package"
+    
+    if [[ ! -f "$pc_file" || ! -s "$pc_file" ]]; then
+      info "Downloading Package Control 4..."
+      sudo -u "$real_user" curl -sSLo "$pc_file" "https://download.sublimetext.com/Package%20Control.sublime-package" 2>/dev/null || true
+    else
+      info "Package Control 4 already exists, skipping download."
+    fi
+
+    sudo -u "$real_user" bash -c "cat << 'EOF' > '$st_user_pkg_dir/Preferences.sublime-settings'
+{
+  \"always_show_minimap_viewport\": true,
+  \"auto_complete\": true,
+  \"bold_folder_labels\": true,
+  \"fallback_encoding\": \"Cyrillic (Windows 1251)\",
+  \"font_face\": \"Monospace\",
+  \"font_size\": 12,
+  \"ignored_packages\":
+  [
+    \"Vintage\"
+  ],
+  \"indent_guide_options\":
+  [
+    \"draw_normal\",
+    \"draw_active\"
+  ],
+  \"line_padding_bottom\": 2,
+  \"line_padding_top\": 2,
+  \"index_files\": false,
+  \"theme\": \"GitHub Dark.sublime-theme\",
+  \"color_scheme\": \"OLED.sublime-color-scheme\"
+}
+EOF"
+
+    sudo -u "$real_user" bash -c "cat << 'EOF' > '$st_user_pkg_dir/Package Control.sublime-settings'
+{
+  \"bootstrapped\": true,
+  \"auto_upgrade\": true,
+  \"install_missing\": true,
+  \"channels\":
+  [
+    \"https://packages.sublimetext.io/channel.json\"
+  ],
+  \"installed_packages\":
+  [
+    \"PackageDev\",
+    \"OLED Color Scheme\",
+    \"GitHub Theme\",
+    \"Color Highlight\",
+    \"Highlighter\"
+  ]
+}
+EOF"
+  done
+  fixed "Sublime Text configured with Flatpak-safe downloader and auto-install plugins."
+}
+
+# ===========================================================================
+# Extreme Firefox (Flatpak) hardening
+# ===========================================================================
+setup_firefox_prefs() {
+  local real_user="${1:-${REAL_USER:-}}"
+  local user_home="${2:-${USER_HOME:-}}"
+
+  if [[ -z "$real_user" || "$real_user" == "root" || -z "$user_home" || ! -d "$user_home" ]]; then
+    warn "Valid non-root user/home not found for Firefox configuration."
+    return 0
+  fi
+
+  if ! command -v flatpak >/dev/null 2>&1 ||
+     ! sudo -u "$real_user" flatpak info org.mozilla.firefox >/dev/null 2>&1; then
+    info "Firefox Flatpak not detected – skipped Firefox hardening."
+    return 0
+  fi
+
+  local ff_base="$user_home/.var/app/org.mozilla.firefox/.mozilla/firefox"
+  local candidate profile_dir
+  for candidate in \
+    "$user_home/.var/app/org.mozilla.firefox/.mozilla/firefox" \
+    "$user_home/.var/app/org.mozilla.firefox/config/.mozilla/firefox" \
+    "$user_home/.var/app/org.mozilla.firefox/data/.mozilla/firefox"; do
+    if [[ -d "$candidate" ]]; then
+      ff_base="$candidate"
+      break
+    fi
+  done
+  sudo -u "$real_user" mkdir -p "$ff_base"
+
+  profile_dir=$(find "$ff_base" -mindepth 1 -maxdepth 1 -type d \
+    \( -name '*.default-release' -o -name '*.default' \) -print -quit 2>/dev/null || true)
+  if [[ -z "$profile_dir" ]]; then
+    profile_dir="$ff_base/default.default-release"
+    sudo -u "$real_user" mkdir -p "$profile_dir"
+  fi
+
+  info "Writing deduplicated Firefox privacy/security preferences to $profile_dir/user.js"
+  sudo -u "$real_user" tee "$profile_dir/user.js" >/dev/null <<'FIREFOX_PREFS_EOF'
+user_pref("browser.privatebrowsing.autostart", true);
+user_pref("media.peerconnection.enabled", false);
+user_pref("media.peerconnection.ice.default_address_only", true);
+user_pref("media.peerconnection.ice.no_host", true);
+user_pref("media.peerconnection.ice.proxy_only", true);
+user_pref("media.peerconnection.ice.proxy_only_if_behind_proxy", true);
+user_pref("datareporting.healthreport.uploadEnabled", false);
+user_pref("datareporting.policy.dataSubmissionEnabled", false);
+user_pref("toolkit.telemetry.enabled", false);
+user_pref("toolkit.telemetry.unified", false);
+user_pref("toolkit.telemetry.server", "");
+user_pref("toolkit.telemetry.archive.enabled", false);
+user_pref("toolkit.telemetry.newProfilePing.enabled", false);
+user_pref("toolkit.telemetry.shutdownPingSender.enabled", false);
+user_pref("toolkit.telemetry.updatePing.enabled", false);
+user_pref("toolkit.telemetry.bhrPing.enabled", false);
+user_pref("toolkit.telemetry.firstShutdownPing.enabled", false);
+user_pref("browser.ping-centre.telemetry", false);
+user_pref("browser.newtabpage.activity-stream.feeds.telemetry", false);
+user_pref("browser.newtabpage.activity-stream.telemetry", false);
+user_pref("experiments.activeExperiment", false);
+user_pref("experiments.enabled", false);
+user_pref("experiments.supported", false);
+user_pref("app.shield.optoutstudies.enabled", false);
+user_pref("app.normandy.enabled", false);
+user_pref("app.normandy.api_url", "");
+user_pref("extensions.pocket.enabled", false);
+user_pref("extensions.pocket.api", "");
+user_pref("extensions.pocket.oAuthConsumerKey", "");
+user_pref("extensions.pocket.site", "");
+user_pref("browser.discovery.enabled", false);
+user_pref("browser.discovery.sites", "");
+user_pref("privacy.trackingprotection.enabled", true);
+user_pref("privacy.trackingprotection.pbmode.enabled", true);
+user_pref("privacy.trackingprotection.cryptomining.enabled", true);
+user_pref("privacy.trackingprotection.fingerprinting.enabled", true);
+user_pref("privacy.trackingprotection.emailtracking.enabled", true);
+user_pref("privacy.trackingprotection.socialtracking.enabled", true);
+user_pref("browser.contentblocking.category", "strict");
+user_pref("privacy.annotate_channels.strict_list.enabled", true);
+user_pref("privacy.donottrackheader.enabled", true);
+user_pref("privacy.resistFingerprinting", true);
+user_pref("privacy.resistFingerprinting.letterboxing", true);
+user_pref("privacy.firstparty.isolate", true);
+user_pref("network.cookie.cookieBehavior", 5);
+user_pref("network.cookie.lifetimePolicy", 2);
+user_pref("network.cookie.thirdparty.sessionOnly", true);
+user_pref("network.cookie.thirdparty.nonsecureSessionOnly", true);
+user_pref("privacy.sanitize.sanitizeOnShutdown", true);
+user_pref("privacy.clearOnShutdown.cache", true);
+user_pref("privacy.clearOnShutdown.cookies", true);
+user_pref("privacy.clearOnShutdown.downloads", true);
+user_pref("privacy.clearOnShutdown.formdata", true);
+user_pref("privacy.clearOnShutdown.history", true);
+user_pref("privacy.clearOnShutdown.offlineApps", true);
+user_pref("privacy.clearOnShutdown.sessions", true);
+user_pref("privacy.clearOnShutdown.siteSettings", true);
+user_pref("privacy.clearOnShutdown.openWindows", true);
+user_pref("privacy.sanitize.timeSpan", 0);
+user_pref("browser.cache.disk.enable", false);
+user_pref("browser.cache.disk_cache_ssl", false);
+user_pref("browser.cache.memory.enable", true);
+user_pref("browser.cache.memory.capacity", 65536);
+user_pref("browser.privatebrowsing.forceMediaMemoryCache", true);
+user_pref("media.memory_cache_max_size", 65536);
+user_pref("browser.sessionstore.privacy_level", 2);
+user_pref("browser.sessionstore.resume_from_crash", false);
+user_pref("browser.sessionstore.max_tabs_undo", 0);
+user_pref("browser.sessionstore.max_windows_undo", 0);
+user_pref("browser.formfill.enable", false);
+user_pref("signon.rememberSignons", false);
+user_pref("signon.autofillForms", false);
+user_pref("signon.formlessCapture.enabled", false);
+user_pref("browser.startup.page", 0);
+user_pref("browser.startup.homepage", "about:blank");
+user_pref("browser.newtabpage.enabled", false);
+user_pref("browser.newtab.preload", false);
+user_pref("network.dns.disablePrefetch", true);
+user_pref("network.dns.disablePrefetchFromHTTPS", true);
+user_pref("network.prefetch-next", false);
+user_pref("network.predictor.enabled", false);
+user_pref("network.predictor.enable-prefetch", false);
+user_pref("network.http.speculative-parallel-limit", 0);
+user_pref("network.http.referer.XOriginPolicy", 2);
+user_pref("network.http.referer.XOriginTrimmingPolicy", 2);
+user_pref("network.http.referer.defaultPolicy", 2);
+user_pref("network.http.referer.defaultPolicy.pbmode", 2);
+user_pref("network.http.sendRefererHeader", 0);
+user_pref("network.IDN_show_punycode", true);
+user_pref("geo.enabled", false);
+user_pref("geo.provider.network.url", "");
+user_pref("geo.provider.use_gpsd", false);
+user_pref("geo.provider.use_geoclue", false);
+user_pref("browser.search.suggest.enabled", false);
+user_pref("browser.urlbar.suggest.searches", false);
+user_pref("browser.urlbar.suggest.engines", false);
+user_pref("browser.urlbar.suggest.quicksuggest.nonsponsored", false);
+user_pref("browser.urlbar.suggest.quicksuggest.sponsored", false);
+user_pref("browser.urlbar.speculativeConnect.enabled", false);
+user_pref("dom.battery.enabled", false);
+user_pref("dom.event.clipboardevents.enabled", false);
+user_pref("media.navigator.enabled", false);
+user_pref("media.getusermedia.screensharing.enabled", false);
+user_pref("media.getusermedia.audiocapture.enabled", false);
+user_pref("media.getusermedia.browser.enabled", false);
+user_pref("camera.control.face_detection.enabled", false);
+user_pref("device.sensors.enabled", false);
+user_pref("device.sensors.motion.enabled", false);
+user_pref("device.sensors.orientation.enabled", false);
+user_pref("device.sensors.ambientLight.enabled", false);
+user_pref("device.sensors.proximity.enabled", false);
+user_pref("webgl.disabled", true);
+user_pref("webgl.enable-webgl2", false);
+user_pref("gfx.font_rendering.opentype_svg.enabled", false);
+user_pref("gfx.font_rendering.graphite.enabled", false);
+user_pref("browser.display.use_document_fonts", 0);
+user_pref("dom.security.https_only_mode", true);
+user_pref("dom.security.https_only_mode_ever_enabled", true);
+user_pref("network.stricttransportsecurity.preloadlist", true);
+user_pref("security.ssl.require_safe_negotiation", true);
+user_pref("security.ssl.treat_unsafe_negotiation_as_broken", true);
+user_pref("security.tls.version.min", 3);
+user_pref("security.tls.enable_0rtt_data", false);
+user_pref("security.cert_pinning.enforcement_level", 2);
+user_pref("security.pki.sha1_enforcement_level", 1);
+user_pref("browser.safebrowsing.malware.enabled", true);
+user_pref("browser.safebrowsing.phishing.enabled", true);
+user_pref("browser.safebrowsing.downloads.enabled", true);
+user_pref("browser.safebrowsing.downloads.remote.enabled", true);
+user_pref("browser.safebrowsing.downloads.remote.block_potentially_unwanted", true);
+user_pref("browser.safebrowsing.downloads.remote.block_uncommon", true);
+user_pref("browser.safebrowsing.allowOverride", false);
+user_pref("dom.serviceWorkers.enabled", false);
+user_pref("dom.push.enabled", false);
+user_pref("dom.push.connection.enabled", false);
+user_pref("dom.push.serverURL", "");
+user_pref("beacon.enabled", false);
+user_pref("browser.send_pings", false);
+user_pref("browser.send_pings.require_same_host", true);
+user_pref("dom.event.contextmenu.enabled", false);
+user_pref("dom.disable_window_move_resize", true);
+user_pref("dom.disable_window_flip", true);
+user_pref("dom.disable_window_open_feature.close", true);
+user_pref("dom.disable_window_open_feature.location", true);
+user_pref("dom.disable_window_open_feature.menubar", true);
+user_pref("dom.disable_window_open_feature.minimizable", true);
+user_pref("dom.disable_window_open_feature.personalbar", true);
+user_pref("dom.disable_window_open_feature.resizable", true);
+user_pref("dom.disable_window_open_feature.status", true);
+user_pref("dom.disable_window_open_feature.titlebar", true);
+user_pref("dom.disable_window_open_feature.toolbar", true);
+user_pref("dom.popup_allowed_events", "click dblclick mousedown pointerdown");
+user_pref("pdfjs.enableScripting", false);
+user_pref("javascript.options.baselinejit", false);
+user_pref("javascript.options.ion", false);
+user_pref("javascript.options.native_regexp", false);
+user_pref("javascript.options.asmjs", false);
+user_pref("javascript.options.wasm", false);
+user_pref("dom.webaudio.enabled", false);
+user_pref("media.webspeech.synth.enabled", false);
+user_pref("media.webspeech.recognition.enable", false);
+user_pref("dom.gamepad.enabled", false);
+user_pref("dom.vr.enabled", false);
+user_pref("dom.vibrator.enabled", false);
+user_pref("dom.netinfo.enabled", false);
+user_pref("dom.telephony.enabled", false);
+user_pref("dom.enable_performance", false);
+user_pref("dom.enable_resource_timing", false);
+user_pref("dom.enable_user_timing", false);
+user_pref("dom.performance.enable_notify_performance_timing", false);
+user_pref("dom.performance.enable_user_timing_logging", false);
+user_pref("browser.uitour.enabled", false);
+user_pref("browser.uitour.url", "");
+user_pref("devtools.chrome.enabled", false);
+user_pref("devtools.debugger.remote-enabled", false);
+user_pref("toolkit.telemetry.coverage.opt-out", true);
+user_pref("toolkit.coverage.opt-out", true);
+user_pref("toolkit.coverage.endpoint.base", "");
+user_pref("app.update.auto", true);
+user_pref("extensions.update.enabled", true);
+user_pref("extensions.update.autoUpdateDefault", true);
+user_pref("extensions.getAddons.showPane", false);
+user_pref("extensions.htmlaboutaddons.recommendations.enabled", false);
+user_pref("extensions.htmlaboutaddons.discover.enabled", false);
+user_pref("services.sync.enabled", false);
+user_pref("identity.fxaccounts.enabled", false);
+user_pref("browser.aboutwelcome.enabled", false);
+user_pref("browser.startup.firstrunSkipsHomepage", true);
+user_pref("trailhead.firstrun.didSeeAboutWelcome", true);
+user_pref("browser.messaging-system.whatsNewPanel.enabled", false);
+user_pref("browser.startup.homepage_override.mstone", "ignore");
+user_pref("startup.homepage_welcome_url", "");
+user_pref("startup.homepage_welcome_url.additional", "");
+user_pref("startup.homepage_override_url", "");
+user_pref("browser.newtabpage.activity-stream.asrouter.userprefs.cfr.addons", false);
+user_pref("browser.newtabpage.activity-stream.asrouter.userprefs.cfr.features", false);
+user_pref("browser.newtabpage.activity-stream.section.highlights.includePocket", false);
+user_pref("browser.newtabpage.activity-stream.feeds.section.topstories", false);
+user_pref("browser.newtabpage.activity-stream.feeds.topsites", false);
+user_pref("browser.newtabpage.activity-stream.showSponsored", false);
+user_pref("browser.newtabpage.activity-stream.showSponsoredTopSites", false);
+user_pref("browser.newtabpage.activity-stream.default.sites", "");
+user_pref("browser.newtabpage.activity-stream.enabled", false);
+user_pref("privacy.globalprivacycontrol.enabled", true);
+user_pref("signon.management.page.breach-alerts.enabled", false);
+user_pref("extensions.formautofill.creditCards.enabled", false);
+user_pref("extensions.formautofill.addresses.enabled", false);
+user_pref("browser.link.preview.enabled", false);
+user_pref("browser.tabs.hoverPreview.enabled", false);
+user_pref("browser.translations.enable", false);
+user_pref("layout.spellcheckDefault", 0);
+user_pref("browser.ml.enable", false);
+user_pref("browser.preferences.aiControls", true);
+user_pref("permissions.default.camera", 2);
+user_pref("permissions.default.microphone", 2);
+user_pref("permissions.default.desktop-notification", 2);
+user_pref("permissions.default.xr", 2);
+user_pref("browser.ml.chat.enabled", false);
+user_pref("browser.ml.linkPreview.enabled", false);
+user_pref("browser.urlbar.suggest.history", false);
+user_pref("browser.urlbar.suggest.bookmark", false);
+user_pref("browser.urlbar.suggest.openpage", false);
+user_pref("browser.urlbar.suggest.topsites", false);
+user_pref("browser.urlbar.suggest.recentsearches", false);
+user_pref("browser.urlbar.quickactions.enabled", false);
+user_pref("browser.urlbar.quicksuggest.enabled", false);
+user_pref("permissions.default.geo", 2);
+user_pref("media.autoplay.default", 5);
+user_pref("media.autoplay.blocking_policy", 2);
+user_pref("browser.urlbar.suggest.history", false);
+user_pref("browser.urlbar.suggest.bookmark", false);
+user_pref("browser.urlbar.suggest.openpage", false);
+user_pref("browser.urlbar.suggest.topsites", false);
+user_pref("browser.urlbar.suggest.recentsearches", false);
+user_pref("browser.search.suggest.enabled", false);
+user_pref("browser.urlbar.suggest.searches", false);
+user_pref("browser.urlbar.suggest.quickactions", false);
+user_pref("browser.urlbar.suggest.quicksuggest.sponsored", false);
+user_pref("browser.urlbar.suggest.quicksuggest.nonsponsored", false);
+user_pref("browser.urlbar.quicksuggest.enabled", false);
+user_pref("browser.urlbar.suggest.quicksuggest", false);
+user_pref("privacy.globalprivacycontrol.enabled", true);
+user_pref("privacy.globalprivacycontrol.functionality.enabled", true);
+user_pref("privacy.globalprivacycontrol.pbmode.enabled", true);
+FIREFOX_PREFS_EOF
+  sudo -u "$real_user" chmod 0600 "$profile_dir/user.js"
+  fixed "Firefox user.js written with duplicate preferences removed."
+
+  # Flatpak Firefox reads system policy from its systemconfig extension path.
+  local arch branch pol_dir
+  arch=$(sudo -u "$real_user" flatpak info --show-arch org.mozilla.firefox 2>/dev/null || printf 'x86_64')
+  branch=$(sudo -u "$real_user" flatpak info --show-branch org.mozilla.firefox 2>/dev/null || printf 'stable')
+  pol_dir="/var/lib/flatpak/extension/org.mozilla.firefox.systemconfig/${arch}/${branch}/policies"
+  install -d -m 0755 "$pol_dir"
+  backup_file "$pol_dir/policies.json"
+  cat > "$pol_dir/policies.json" <<'FIREFOX_POLICY_EOF'
+{
+  "policies": {
+    "DefaultGeolocationSetting": 2,
+    "DefaultCameraSetting": 2,
+    "DefaultMicrophoneSetting": 2,
+    "DefaultNotificationsSetting": 2,
+    "DefaultAutoplaySetting": 5,
+    "DefaultWebXRSetting": 2,
+    "AutoplayAllowed": false,
+    "DisableTelemetry": true,
+    "DisableFirefoxStudies": true,
+    "DisablePocket": true,
+    "DisableFirefoxAccounts": true,
+    "DisableAccounts": true,
+    "DisableProfileImport": true,
+    "DisableSetDesktopBackground": true,
+    "DontCheckDefaultBrowser": true,
+    "NoDefaultBookmarks": true,
+    "OfferToSaveLogins": false,
+    "PasswordManagerEnabled": false,
+    "DisableMasterPasswordCreation": true,
+    "DisableFormHistory": true,
+    "DisableSafeBrowsing": false,
+    "SearchSuggestEnabled": false,
+    "TranslateEnabled": false,
+    "AutofillAddressEnabled": false,
+    "AutofillCreditCardEnabled": false,
+    "HttpsOnlyMode": "force_enabled",
+    "NewTabPage": false,
+    "DisableRemoteImprovements": true,
+    "FirefoxSuggest": {
+      "WebSuggestions": false,
+      "SponsoredSuggestions": false,
+      "ImproveSuggest": false,
+      "Locked": true
+    },
+    "Homepage": {
+      "StartPage": "none",
+      "URL": "about:blank",
+      "Locked": true
+    },
+    "GlobalPrivacyControl": {
+      "Value": true,
+      "Locked": true
+    },
+    "AIControls": {
+      "Enabled": false,
+      "Default": {
+        "Value": "blocked",
+        "Locked": true
+      }
+    },
+    "FirefoxHome": {
+      "Search": false,
+      "TopSites": false,
+      "SponsoredTopSites": false,
+      "Highlights": false,
+      "Pocket": false,
+      "SponsoredPocket": false,
+      "Snippets": false,
+      "Locked": true
+    },
+    "EnableTrackingProtection": {
+      "Value": true,
+      "Locked": true,
+      "Cryptomining": true,
+      "Fingerprinting": true,
+      "EmailTracking": true,
+      "Category": "strict"
+    },
+    "Cookies": {
+      "Default": false,
+      "AcceptThirdParty": "never",
+      "Locked": true
+    },
+    "Preferences": {
+      "browser.privatebrowsing.autostart": {
+        "Value": true,
+        "Status": "locked"
+      },
+      "media.peerconnection.enabled": {
+        "Value": false,
+        "Status": "locked"
+      },
+      "privacy.resistFingerprinting": {
+        "Value": true,
+        "Status": "locked"
+      },
+      "privacy.firstparty.isolate": {
+        "Value": true,
+        "Status": "locked"
+      },
+      "browser.cache.disk.enable": {
+        "Value": false,
+        "Status": "locked"
+      },
+      "webgl.disabled": {
+        "Value": true,
+        "Status": "locked"
+      },
+      "geo.enabled": {
+        "Value": false,
+        "Status": "locked"
+      },
+      "browser.urlbar.suggest.history": {
+        "Value": false,
+        "Status": "locked"
+      },
+      "browser.urlbar.suggest.bookmark": {
+        "Value": false,
+        "Status": "locked"
+      },
+      "browser.urlbar.suggest.openpage": {
+        "Value": false,
+        "Status": "locked"
+      },
+      "browser.urlbar.suggest.topsites": {
+        "Value": false,
+        "Status": "locked"
+      },
+      "browser.urlbar.suggest.recentsearches": {
+        "Value": false,
+        "Status": "locked"
+      },
+      "browser.urlbar.suggest.engines": {
+        "Value": false,
+        "Status": "locked"
+      },
+      "browser.urlbar.suggest.searches": {
+        "Value": false,
+        "Status": "locked"
+      },
+      "browser.search.suggest.enabled": {
+        "Value": false,
+        "Status": "locked"
+      },
+      "privacy.globalprivacycontrol.enabled": {
+        "Value": true,
+        "Status": "locked"
+      }
+    },
+    "ExtensionSettings": {
+      "*": {
+        "installation_mode": "blocked",
+        "blocked_install_message": "Only uBlock Origin is allowed by system policy."
+      },
+      "uBlock0@raymondhill.net": {
+        "installation_mode": "force_installed",
+        "install_url": "https://addons.mozilla.org/firefox/downloads/latest/ublock-origin/latest.xpi"
+      }
+    }
+  }
+}
+FIREFOX_POLICY_EOF
+  chmod 0644 "$pol_dir/policies.json"
+  fixed "Firefox enterprise policies written (uBlock Origin forced; Safe Browsing retained)."
+}
+# ===========================================================================
+# Chromium / Ungoogled Chromium (Flatpak) – milder (keep history & sessions)
+# ===========================================================================
+setup_chromium_prefs() {
+  local real_user="${1:-$REAL_USER}"
+  local user_home="${2:-$USER_HOME}"
+  
+  if [[ -z "$user_home" || ! -d "$user_home" ]]; then
+    warn "User home directory not found for Chromium configuration."
+    return
+  fi
+
+  info "Applying security overrides and enterprise policies for Chromium-based browsers (Flatpak)..."
+
+  if ! command -v flatpak &>/dev/null; then
+    warn "Flatpak not installed – skipping Chromium browser hardening."
+    return
+  fi
+
+  # Combined flags incorporating your requirements without deprecated entries
+  local CHROMIUM_FLAGS="--force-webrtc-ip-handling-policy=disable_non_proxied_udp --disable-background-mode --disable-breakpad --disable-background-networking --disable-domain-reliability --disable-default-apps --disable-sync --disable-speech-api --disable-spellchecking --disable-auto-reload --no-first-run --password-store=gnome-libsecret --disable-features=AutofillServerCommunication,InterestFeedContentSuggestions,TranslateUI,MediaRouter,DialMediaRouteProvider,OptimizationHints,InterestFeed,HelpMeWrite,TabOrganization,AI,LinkPreviews,Translate,TabSearch,AutofillCreditCard,AutofillAddressEnabled,ComponentExtensionsWithBackgroundPages"
+
+  # Enterprise policies JSON strictly mapped to your parameters
+  local policy_json
+  policy_json=$(cat <<'EOF'
+{
+  "SafeBrowsingProtectionLevel": 2,
+  "HttpsOnlyMode": "force_enabled",
+  "BlockThirdPartyCookies": true,
+  "DefaultGeolocationSetting": 2,
+  "DefaultNotificationsSetting": 2,
+  "DefaultSensorsSetting": 2,
+  "DefaultPopupsSetting": 2,
+  "DefaultAutomaticDownloadsSetting": 2,
+  "PasswordManagerEnabled": false,
+  "SearchSuggestEnabled": false,
+  "SpellCheckServiceEnabled": false,
+  "BackgroundModeEnabled": false,
+  "SitePerProcess": true,
+  "BookmarkBarEnabled": false,
+  "HighEfficiencyModeEnabled": true,
+  "RestoreOnStartup": 1
+}
+EOF
+)
+
+  # 1. Standard Chromium
+  if sudo -u "$real_user" flatpak info org.chromium.Chromium &>/dev/null; then
+    info "Hardening Chromium (Flatpak)..."
+    sudo -u "$real_user" flatpak override --user org.chromium.Chromium \
+      --nofilesystem=host \
+      --nosocket=x11 \
+      --socket=wayland \
+      --nodevice=all 2>/dev/null || true
+
+    sudo -u "$real_user" flatpak override --user org.chromium.Chromium \
+      --env=CHROMIUM_FLAGS="$CHROMIUM_FLAGS" 2>/dev/null || true
+
+    local chromium_policy_dir="$user_home/.var/app/org.chromium.Chromium/config/chromium/policies/managed"
+    sudo -u "$real_user" mkdir -p "$chromium_policy_dir"
+    echo "$policy_json" | sudo -u "$real_user" tee "$chromium_policy_dir/policy.json" >/dev/null
+    sudo -u "$real_user" chmod 0600 "$chromium_policy_dir/policy.json"
+
+    sudo -u "$real_user" python3 -c '
+    import json, os
+    for d in ["org.chromium.Chromium", "io.github.ungoogled_software.ungoogled_chromium"]:
+        p = os.path.expanduser(f"~/.var/app/{d}/config/chromium/Default/Preferences")
+        if os.path.exists(os.path.dirname(p)):
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            data = {}
+            if os.path.exists(p):
+                try:
+                    with open(p, "r") as f: data = json.load(f)
+                except: pass
+            data.setdefault("session", {})["restore_on_startup"] = 1
+            with open(p, "w") as f: json.dump(data, f)
+    ' 2>/dev/null || true
+
+    fixed "Chromium (Flatpak) sandbox, flags, policies & startup session applied."
+  else
+    info "Chromium (Flatpak) not installed – skipped."
+  fi
+
+  # 2. Ungoogled Chromium
+  if sudo -u "$real_user" flatpak info io.github.ungoogled_software.ungoogled_chromium &>/dev/null; then
+    info "Hardening Ungoogled Chromium (Flatpak)..."
+    sudo -u "$real_user" flatpak override --user io.github.ungoogled_software.ungoogled_chromium \
+      --nofilesystem=host \
+      --nosocket=x11 \
+      --socket=wayland \
+      --nodevice=all 2>/dev/null || true
+
+    local UG_FLAGS="$CHROMIUM_FLAGS --keep-old-history --disable-search-engine-collection --extension-mime-request-handling=always-prompt-for-install --fingerprinting-canvas-image-data-noise --fingerprinting-canvas-measuretext-noise --fingerprinting-client-rects-noise"
+    sudo -u "$real_user" flatpak override --user io.github.ungoogled_software.ungoogled_chromium \
+      --env=CHROMIUM_FLAGS="$UG_FLAGS" 2>/dev/null || true
+
+    local ug_policy_dir="$user_home/.var/app/io.github.ungoogled_software.ungoogled_chromium/config/chromium/policies/managed"
+    sudo -u "$real_user" mkdir -p "$ug_policy_dir"
+    echo "$policy_json" | sudo -u "$real_user" tee "$ug_policy_dir/policy.json" >/dev/null
+    sudo -u "$real_user" chmod 0600 "$ug_policy_dir/policy.json"
+
+    fixed "Ungoogled Chromium (Flatpak) sandbox, flags & enterprise policies applied."
+  else
+    info "Ungoogled Chromium (Flatpak) not installed – skipped."
+  fi
 }
 
 printf '\n=== Fedora Security Hardening Ultimate v%s ===\n' "$VERSION"
@@ -797,8 +1455,8 @@ fi
 section '15. User Profile Files Lockdown'
 
 if [[ $LOCKDOWN_BASHRC == true ]]; then
-  info "Lockdown of user profile files is enabled (LOCKDOWN_BASHRC=true)"
-  REAL_USER_LOCK="${SUDO_USER:-$(logname 2>/dev/null || whoami)}"
+  info "User profile lockdown is enabled (LOCKDOWN_BASHRC=true)"
+  REAL_USER_LOCK=$(resolve_real_user)
   USER_HOME_DIR=$(getent passwd "$REAL_USER_LOCK" | cut -d: -f6)
 
   if [[ -n "$USER_HOME_DIR" && -d "$USER_HOME_DIR" ]]; then
@@ -907,6 +1565,7 @@ dnf_apps=(
 )
 declare -A flatpak_apps=(
   [flatseal]="com.github.tchx84.Flatseal"
+  [ungoogled_chromium]="io.github.ungoogled_software.ungoogled_chromium"
   [firefox]="org.mozilla.firefox"
   [chromium]="org.chromium.Chromium"
   [filezilla]="org.filezillaproject.Filezilla"
@@ -976,15 +1635,10 @@ if [[ $INSTALL_OPTIONAL_SOFTWARE == true ]]; then
   done
 
   if [[ $MODE == apply ]] && rpm -q easyeffects &>/dev/null; then
-    _target_user="${SUDO_USER:-$(logname 2>/dev/null || whoami)}"
-    if [[ "$_target_user" == "root" ]]; then
-      _target_user=$(awk -v tty="$(tty 2>/dev/null | sed 's|/dev/||')" '$2 == tty {print $1}' /proc/self/loginuid 2>/dev/null || true)
-      [[ -z "$_target_user" || "$_target_user" == "root" ]] && _target_user=$(users 2>/dev/null | awk '{print $1}')
-    fi
+    _target_user=$(resolve_real_user)
     if [[ -n "$_target_user" && "$_target_user" != "root" ]]; then
       sudo -u "$_target_user" bash << 'EE_EOF'
         mkdir -p ~/.config/autostart
-        # Удаляем старый «кривой» файл, если он остался
         rm -f ~/.config/autostart/easyeffects-service.desktop
         cat <<'EOF' > ~/.config/autostart/com.github.wwmm.easyeffects.desktop
 [Desktop Entry]
@@ -1001,12 +1655,35 @@ X-GNOME-Autostart-enabled=true
 X-GNOME-Autostart-Phase=Application
 EOF
 EE_EOF
-      fixed "Added Easy Effects (DNF) to user autostart (proper desktop file)"
+      fixed "Added Easy Effects (DNF) to user autostart"
+    fi
+  fi
+
+  # Apply browser hardening after possible installation
+  if [[ $MODE == apply ]]; then
+    REAL_USER=$(resolve_real_user)
+    USER_HOME=$(getent passwd "$REAL_USER" | cut -d: -f6)
+    if [[ -n "$REAL_USER" && "$REAL_USER" != "root" && -d "$USER_HOME" ]]; then
+      setup_firefox_prefs "$REAL_USER" "$USER_HOME"
+      setup_chromium_prefs "$REAL_USER" "$USER_HOME"
+      if [[ -n "${flatpak_apps[sublimetext]:-}" ]]; then
+        setup_sublime_text "$REAL_USER" "$USER_HOME"
+      fi
     fi
   fi
 
 else
   info "Optional software deployment is skipped (set INSTALL_OPTIONAL_SOFTWARE=true in script to activate)"
+fi
+
+# Always attempt browser hardening in apply mode even if software install was skipped
+if [[ $MODE == apply ]]; then
+  REAL_USER=$(resolve_real_user)
+  USER_HOME=$(getent passwd "$REAL_USER" | cut -d: -f6)
+  if [[ -n "$REAL_USER" && "$REAL_USER" != "root" && -d "$USER_HOME" ]]; then
+    setup_firefox_prefs "$REAL_USER" "$USER_HOME"
+    setup_chromium_prefs "$REAL_USER" "$USER_HOME"
+  fi
 fi
 
 # ===========================================================================
@@ -1020,7 +1697,7 @@ if [[ $INSTALL_HARDENED_MALLOC == true ]]; then
   WORK_DIR="/var/tmp/hardened_malloc_build"
   HASH_FILE="/var/lib/hardened_malloc.sha256"
 
-  REAL_USER="${SUDO_USER:-$(logname 2>/dev/null || whoami)}"
+  REAL_USER=$(resolve_real_user)
 
   if [[ -f "$LIB_DEST" ]]; then
     ok "Hardened malloc library is present at $LIB_DEST"
@@ -1157,13 +1834,8 @@ section '19. GNOME Panel, App Folders, MacTahoe Icons/Cursors & Tiling Shell'
 
 if [[ "$SETUP_GNOME_LAYOUT" == true ]]; then
   if [[ "$IS_DESKTOP" == true ]]; then
-    REAL_USER="${SUDO_USER:-$(logname 2>/dev/null || whoami)}"
+    REAL_USER=$(resolve_real_user)
     
-    if [[ "$REAL_USER" == "root" ]]; then
-      REAL_USER=$(awk -v tty="$(tty 2>/dev/null | sed 's|/dev/||')" '$2 == tty {print $1}' /proc/self/loginuid 2>/dev/null || true)
-      [[ -z "$REAL_USER" || "$REAL_USER" == "root" ]] && REAL_USER=$(users 2>/dev/null | awk '{print $1}')
-    fi
-
     USER_HOME=$(getent passwd "$REAL_USER" | cut -d: -f6)
     USER_UID=$(id -u "$REAL_USER" 2>/dev/null || echo 1000)
     
@@ -1171,7 +1843,7 @@ if [[ "$SETUP_GNOME_LAYOUT" == true ]]; then
       info "Configuring GNOME for user: $REAL_USER (home directory: $USER_HOME)"
 
       if [[ "$MODE" == "apply" ]]; then
-        # Install GNOME extensions and dependencies (with check if already installed)
+        # Install GNOME extensions and dependencies
         info "Checking and installing GNOME extensions (Dash to Dock, Tiling Shell)..."
         dnf install -y python3-pip jq unzip curl git glib2-devel &>/dev/null || true
         
@@ -1189,7 +1861,7 @@ if [[ "$SETUP_GNOME_LAYOUT" == true ]]; then
           gnome-extensions enable dash-to-dock@micxgx.gmail.com 2>/dev/null || true
           gnome-extensions enable tilingshell@ferrarodomenico.com 2>/dev/null || true
 
-          # Compile schemas so gsettings can access Tiling Shell and other extension settings
+          # Compile schemas
           mkdir -p "$HOME/.local/share/glib-2.0/schemas"
           for ext_dir in "$HOME/.local/share/gnome-shell/extensions/"*; do
               if [[ -d "$ext_dir/schemas" ]]; then
@@ -1200,7 +1872,7 @@ if [[ "$SETUP_GNOME_LAYOUT" == true ]]; then
 EXT_EOF
         fixed "GNOME extensions checked/installed and schemas compiled"
 
-        # Установка иконки и курсоров MacTahoe (с проверкой их наличия)
+        # MacTahoe icons & cursors
         info "Checking MacTahoe icons and cursors..."
         sudo -u "$REAL_USER" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$USER_UID/bus" bash << 'MACTAHOE_EOF'
           set -e
@@ -1247,30 +1919,20 @@ EXT_EOF
 MACTAHOE_EOF
         fixed "MacTahoe icons and cursors checked/configured"
 
-        # Применение разметки для Tiling Shell (два монитора)
+        # Tiling Shell multi-monitor layout
         info "Applying Tiling Shell multi-monitor layout configuration..."
         sudo -u "$REAL_USER" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$USER_UID/bus" bash << 'TILING_EOF'
           LAYOUT_JSON='[{"id":"13321385","tiles":[{"x":0,"y":0,"width":1,"height":0.3331766917293233,"groups":[2]},{"x":0,"y":0.3331766917293233,"width":1,"height":0.3336466165413534,"groups":[2,3]},{"x":0,"y":0.6668233082706767,"width":1,"height":0.33317669172932335,"groups":[3]}]},{"id":"13564581","tiles":[{"x":0,"y":0,"width":0.5,"height":1,"groups":[1]},{"x":0.5,"y":0,"width":0.49999999999999206,"height":1,"groups":[1]}]}]'
 
           if gsettings list-schemas | grep -q "org.gnome.shell.extensions.tilingshell"; then
-              # Правильный ключ — layouts-json
               gsettings set org.gnome.shell.extensions.tilingshell layouts-json "$LAYOUT_JSON" 2>/dev/null || true
-
-              # Активируем раскладки на мониторах (id из LAYOUT_JSON)
-              # Формат: массив массивов — по одному id на каждый монитор/workspace
               gsettings set org.gnome.shell.extensions.tilingshell selected-layouts "[['13321385'], ['13564581']]" 2>/dev/null || \
               gsettings set org.gnome.shell.extensions.tilingshell selected-layouts "[['13321385'],['13564581']]" 2>/dev/null || true
           fi
 TILING_EOF
         fixed "Tiling Shell multi-monitor layout applied successfully"
 
-        # Get list of installed Flatpak applications in .desktop format
-        flatpak_desktop_ids=""
-        if command -v flatpak &>/dev/null; then
-          flatpak_desktop_ids=$(sudo -u "$REAL_USER" flatpak list --app --columns=application 2>/dev/null | awk '{print $1".desktop"}' | tr '\n' ' ')
-        fi
-
-        # Fedora 44/45 + GNOME 47+: default is Ptyxis; keep older Console/Terminal as fallback
+        # Favorites & app folders
         TERMINAL_ID=""
         for term_app in \
             "org.gnome.Ptyxis.desktop" \
@@ -1287,6 +1949,7 @@ TILING_EOF
 
         base_favs=(
             "org.gnome.Nautilus.desktop"
+            "io.github.ungoogled_software.ungoogled_chromium.desktop"
             "org.mozilla.firefox.desktop"
             "org.chromium.Chromium.desktop"
             "org.telegram.desktop.desktop"
@@ -1304,16 +1967,12 @@ TILING_EOF
             fav_quoted+=("'$app'")
         done
         FAV_APPS="[$(IFS=,; echo "${fav_quoted[*]}")]"
-
-        # Передаём список избранных в subshell (quoted heredoc не видит host-массивы)
         BASE_FAVS_STR="${base_favs[*]}"
 
         sudo -u "$REAL_USER" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$USER_UID/bus" XDG_RUNTIME_DIR="/run/user/$USER_UID" \
           FAV_APPS="$FAV_APPS" BASE_FAVS_STR="$BASE_FAVS_STR" bash << 'GNOME_EOF'
-          # Применяем проверенный список избранных приложений без создания "битых" локальных копий с именем unnamed
           gsettings set org.gnome.shell favorite-apps "$FAV_APPS"
 
-          # 3. Формирование папки 'Default' (все остальные приложения, кроме закрепленных выше)
           # shellcheck disable=SC2206
           base_favs=( $BASE_FAVS_STR )
           app_list=()
@@ -1339,7 +1998,6 @@ TILING_EOF
           gsettings set org.gnome.desktop.app-folders.folder:/org/gnome/desktop/app-folders/folders/default/ apps "$APPS_ARRAY"
           gsettings set org.gnome.desktop.app-folders.folder:/org/gnome/desktop/app-folders/folders/default/ categories "[]"
 
-          # Динамически очищаем все стандартные папки вне зависимости от локали/языка системы
           current_folders=$(gsettings get org.gnome.desktop.app-folders folder-children | tr -d "[]',")
           for std_folder in $current_folders; do
               [[ "$std_folder" == "default" ]] && continue
@@ -1349,7 +2007,6 @@ TILING_EOF
 
           gsettings set org.gnome.desktop.app-folders folder-children "['default']"
 
-          # Установка монотонного чёрного фона рабочего стола для светлой и темной тем
           gsettings set org.gnome.desktop.background picture-uri ''
           gsettings set org.gnome.desktop.background picture-uri-dark ''
           gsettings set org.gnome.desktop.background primary-color '#000000'
@@ -1377,23 +2034,16 @@ section '20. Recommended System Preferences'
 
 if [[ "$SETUP_SYSTEM_PREFS" == true ]]; then
   if [[ "$IS_DESKTOP" == true ]]; then
-    REAL_USER="${SUDO_USER:-$(logname 2>/dev/null || whoami)}"
-    if [[ "$REAL_USER" == "root" ]]; then
-      REAL_USER=$(awk -v tty="$(tty 2>/dev/null | sed 's|/dev/||')" '$2 == tty {print $1}' /proc/self/loginuid 2>/dev/null || true)
-      [[ -z "$REAL_USER" || "$REAL_USER" == "root" ]] && REAL_USER=$(users 2>/dev/null | awk '{print $1}')
-    fi
+    REAL_USER=$(resolve_real_user)
     USER_UID=$(id -u "$REAL_USER" 2>/dev/null || echo 1000)
 
     if [[ -n "$REAL_USER" && "$REAL_USER" != "root" ]]; then
       info "Applying system preferences for user: $REAL_USER"
 
       if [[ "$MODE" == "apply" ]]; then
-        # --- Power mode → Performance (works with both power-profiles-daemon and tuned-ppd) ---
-        # Fedora 41+ ships tuned-ppd by default; powerprofilesctl exists only with the real ppd package.
         if command -v powerprofilesctl &>/dev/null; then
           powerprofilesctl set performance 2>/dev/null || true
         elif command -v tuned-adm &>/dev/null; then
-          # tuned-ppd maps "performance" → throughput-performance
           tuned-adm profile throughput-performance 2>/dev/null || \
           tuned-adm profile latency-performance 2>/dev/null || true
         fi
@@ -1401,11 +2051,36 @@ if [[ "$SETUP_SYSTEM_PREFS" == true ]]; then
         sudo -u "$REAL_USER" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$USER_UID/bus" XDG_RUNTIME_DIR="/run/user/$USER_UID" bash << 'PREFS_EOF'
           set +e
 
-          # --- Keyboard: English primary + Russian additional, hotkey Shift + Alt ---
+          # Keyboard: English primary + Russian additional, hotkey Shift + Alt
           gsettings set org.gnome.desktop.input-sources sources "[('xkb', 'us'), ('xkb', 'ru')]"
           gsettings set org.gnome.desktop.input-sources xkb-options "['grp:alt_shift_toggle', 'grp:shift_caps_toggle']"
 
-          # --- Microphone input volume → 0 (with XDG_RUNTIME_DIR context) ---
+          # Disable F10 menu accelerator globally via GTK settings (fixes mcedit/ncurses in Ptyxis & GTK apps)
+          for gtk_dir in "$HOME/.config/gtk-3.0" "$HOME/.config/gtk-4.0"; do
+            mkdir -p "$gtk_dir"
+            ini_file="$gtk_dir/settings.ini"
+            if [[ -f "$ini_file" ]]; then
+              if grep -q "gtk-menu-bar-accel" "$ini_file"; then
+                sed -i 's/^[[:space:]]*gtk-menu-bar-accel.*/gtk-menu-bar-accel = ""/' "$ini_file"
+              else
+                sed -i '/^\[Settings\]/a gtk-menu-bar-accel = ""' "$ini_file" 2>/dev/null || echo 'gtk-menu-bar-accel = ""' >> "$ini_file"
+              fi
+            else
+              printf '[Settings]\ngtk-menu-bar-accel = ""\n' > "$ini_file"
+            fi
+          done
+
+          # Terminal (Ptyxis): Register custom XTerm palette file and assign it by Name to profiles
+          if command -v dconf &>/dev/null; then
+            for prof_path in $(dconf list /org/gnome/Ptyxis/Profiles/ 2>/dev/null); do
+              dconf write "/org/gnome/Ptyxis/Profiles/${prof_path}palette" "'xterm'" 2>/dev/null || true
+            done
+          fi
+
+          # Window Management: Close window with Alt+Q (and Alt+F4)
+          gsettings set org.gnome.desktop.wm.keybindings close "['<Alt>q', '<Alt>F4']"
+
+          # Microphone input volume → 0
           export XDG_RUNTIME_DIR="/run/user/$(id -u)"
           if command -v pactl &>/dev/null; then
             DEFAULT_SOURCE=$(pactl get-default-source 2>/dev/null || true)
@@ -1419,7 +2094,7 @@ if [[ "$SETUP_SYSTEM_PREFS" == true ]]; then
             done
           fi
 
-          # --- Power mode → Performance (user-session fallback) ---
+          # Power mode → Performance
           if command -v powerprofilesctl &>/dev/null; then
             powerprofilesctl set performance 2>/dev/null || true
           elif command -v tuned-adm &>/dev/null; then
@@ -1427,57 +2102,50 @@ if [[ "$SETUP_SYSTEM_PREFS" == true ]]; then
             tuned-adm profile latency-performance 2>/dev/null || true
           fi
 
-          # --- Blank screen / power saving: never ---
-          gsettings set org.gnome.desktop.session idle-delay 0
+          # Blank screen / power saving: never
+          gsettings set org.gnome.desktop.session idle-delay 300
           gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-ac-type 'nothing' 2>/dev/null || true
           gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-battery-type 'nothing' 2>/dev/null || true
           gsettings set org.gnome.settings-daemon.plugins.power idle-dim false 2>/dev/null || true
 
-          # --- Automatic screen lock: off ---
-          gsettings set org.gnome.desktop.screensaver lock-enabled false
+          # Automatic screen lock: off
+          gsettings set org.gnome.desktop.screensaver lock-enabled true
           gsettings set org.gnome.desktop.screensaver lock-delay 0
 
-          # --- Dynamic workspaces → fixed, count = 1 ---
+          # Dynamic workspaces → fixed, count = 1
           gsettings set org.gnome.mutter dynamic-workspaces false
           gsettings set org.gnome.desktop.wm.preferences num-workspaces 1
 
-          # --- Appearance: Dark ---
+          # Appearance: Dark
           gsettings set org.gnome.desktop.interface color-scheme 'prefer-dark'
           gsettings set org.gnome.desktop.interface gtk-theme 'Adwaita-dark' 2>/dev/null || true
 
-          # --- Lock Screen notifications: off ---
+          # Lock Screen notifications: off
           gsettings set org.gnome.desktop.notifications show-in-lock-screen false 2>/dev/null || true
           gsettings set org.gnome.desktop.screensaver show-notifications false 2>/dev/null || true
 
-          # --- App Search in overview: off ---
+          # App Search in overview: off
           gsettings set org.gnome.desktop.search-providers disable-external true 2>/dev/null || true
-          # Hide all providers if the key exists
-          if gsettings list-keys org.gnome.desktop.search-providers 2>/dev/null | grep -q disabled; then
-            CURRENT=$(gsettings get org.gnome.desktop.search-providers disabled 2>/dev/null || echo "[]")
-            # Leave as-is if already set; otherwise we just rely on disable-external
-            true
-          fi
 
-          # --- Location services: force off ---
+          # Location services: force off
           gsettings set org.gnome.system.location enabled false
 
-          # --- File History: keep 30 days ---
+          # File History: keep 30 days
           gsettings set org.gnome.desktop.privacy remember-recent-files true
           gsettings set org.gnome.desktop.privacy recent-files-max-age 30
 
-          # --- Automatically Empty Trash + Delete Temporary Files (30 days) ---
+          # Automatically Empty Trash + Delete Temporary Files (30 days)
           gsettings set org.gnome.desktop.privacy remove-old-trash-files true
           gsettings set org.gnome.desktop.privacy remove-old-temp-files true
           gsettings set org.gnome.desktop.privacy old-files-age 30
 
-          # --- Regional formats: Russian Federation, 24h, Monday first ---
-          # System language stays English; only formats become Russian
+          # Regional formats: Russian Federation, 24h, Monday first
           gsettings set org.gnome.system.locale region 'ru_RU.UTF-8' 2>/dev/null || true
           gsettings set org.gnome.desktop.interface clock-format '24h'
           gsettings set org.gnome.desktop.calendar week-start-day-name 'monday' 2>/dev/null || \
             gsettings set org.gnome.desktop.calendar week-start-day 1 2>/dev/null || true
 
-          # --- Clock & Calendar: show seconds ---
+          # Clock & Calendar: show seconds
           gsettings set org.gnome.desktop.interface clock-show-seconds true
           gsettings set org.gnome.desktop.interface clock-show-date true
           gsettings set org.gnome.desktop.interface clock-show-weekday true 2>/dev/null || true
@@ -1507,6 +2175,7 @@ if [[ $MODE == apply ]]; then
   info "Full log written to: $LOG_FILE"
   info ""
   info "IMPORTANT: Reboot the system for kernel arguments and module blacklist to take full effect."
+  info "Firefox: After first launch open uBlock Origin → Filter lists → enable every list + 'Block remote fonts'."
 else
   info "Audit finished. No changes were made."
   info "To apply hardening:  sudo $0 --apply"
