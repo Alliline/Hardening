@@ -17,7 +17,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-VERSION='2.4'
+VERSION='2.5'
 MODE='audit'
 FORCE_SSH_KEEP=true          # set to false if you really want to remove SSH from public zone
 AGGRESSIVE_USERNS=false      # set to true to disable unprivileged user namespaces (breaks Flatpak/Podman rootless)
@@ -1960,7 +1960,7 @@ if [[ $INSTALL_HARDENED_MALLOC == true ]]; then
             --nofilesystem=xdg-videos \
             --nofilesystem=xdg-music \
             --nofilesystem=xdg-desktop \
-            --filesystem=xdg-download \
+            --filesystem=xdg-download:rw \
             --persist=xdg-config \
             --persist=xdg-data \
             --share=network \
