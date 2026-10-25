@@ -2,13 +2,13 @@
 # =============================================================================
 # server.sh
 # Ultimate Security Hardening + LEMP + Redis + Advanced WAF for Fedora Server 44/45+
-# Version: 1.0 (Final Production Edition)
+# Version: 0.2 (Final Production Edition with Dynamic RAM & SSH IP Whitelisting)
 # =============================================================================
 set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-VERSION='0.1'
+VERSION='0.2'
 MODE='audit'
 FORCE_SSH_KEEP=true
 
@@ -19,6 +19,7 @@ HARDEN_NGINX_PHP=true
 ENABLE_FAIL2BAN=true
 SETUP_FIREWALL_HTTP=true
 SSH_PORT=4444
+SSH_ALLOW_IPS=""
 AGGRESSIVE_USERNS=false
 
 # ---------------------------------------------------------------------------
@@ -37,6 +38,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --apply)          MODE='apply'; shift ;;
     --audit)          MODE='audit'; shift ;;
+    --ssh-allow)      MODE='ssh-allow'; SSH_ALLOW_IPS="$2"; shift 2 ;;
     --vhost-add)      MODE='vhost'; VHOST_ACTION='add'; shift ;;
     --vhost-del)      MODE='vhost'; VHOST_ACTION='del'; shift ;;
     --vhost-list)     MODE='vhost'; VHOST_ACTION='list'; shift ;;
@@ -55,6 +57,7 @@ Usage: sudo ./server.sh [OPTION]
 Modes:
   --audit                  Report current security posture (default, no changes)
   --apply                  Apply full system hardening, LEMP stack & security rules
+  --ssh-allow IP_LIST      Restrict SSH port access only to specified comma-separated IPs/CIDRs
 
 Virtual Host Management:
   --vhost-add DOMAIN       Create vhost [--type php|static|redirect] [--target URL]
@@ -184,6 +187,88 @@ write_managed() {
 printf '\n=== Fedora Server Ultimate Hardening + LEMP + WAF v%s ===\n' "$VERSION"
 printf 'Mode: %s | Date: %s | Host: %s | Kernel: %s\n' \
   "$MODE" "$(date -Is)" "$(hostname)" "$(uname -r)"
+
+# ===========================================================================
+# DYNAMIC RAM-BASED PROFILE COMPUTATION (Full Stack Adaptive Tuning)
+# ===========================================================================
+TOTAL_RAM_KB=$(awk '/MemTotal/ {print $2}' /proc/meminfo)
+TOTAL_RAM_MB=$((TOTAL_RAM_KB / 1024))
+
+if (( TOTAL_RAM_MB >= 24000 )); then
+  # 32GB+ server profile
+  INNODB_POOL="8G"
+  REDIS_MAXMEM="6G"
+  MAX_CONNS="500"
+  PHP_MAX_CHILDREN="150"
+  PHP_START_SERVERS="8"
+  PHP_MIN_SPARE="4"
+  PHP_MAX_SPARE="16"
+  PHP_MEMORY_LIMIT="512M"
+  OPCACHE_MEM="512"
+  OPCACHE_FILES="40000"
+  NGINX_WORKER_CONNS="16384"
+  NGINX_FILE_CACHE="20000"
+  MARIADB_TABLE_OPEN_CACHE="8000"
+  MARIADB_POOL_INSTANCES="16"
+  MARIADB_THREAD_POOL_SIZE="32"
+  REDIS_IO_THREADS="8"
+elif (( TOTAL_RAM_MB >= 12000 )); then
+  # 16GB server profile
+  INNODB_POOL="4G"
+  REDIS_MAXMEM="3G"
+  MAX_CONNS="300"
+  PHP_MAX_CHILDREN="100"
+  PHP_START_SERVERS="4"
+  PHP_MIN_SPARE="2"
+  PHP_MAX_SPARE="8"
+  PHP_MEMORY_LIMIT="256M"
+  OPCACHE_MEM="256"
+  OPCACHE_FILES="20000"
+  NGINX_WORKER_CONNS="8192"
+  NGINX_FILE_CACHE="10000"
+  MARIADB_TABLE_OPEN_CACHE="4000"
+  MARIADB_POOL_INSTANCES="8"
+  MARIADB_THREAD_POOL_SIZE="16"
+  REDIS_IO_THREADS="4"
+elif (( TOTAL_RAM_MB >= 6000 )); then
+  # 8GB server profile
+  INNODB_POOL="2G"
+  REDIS_MAXMEM="1500M"
+  MAX_CONNS="200"
+  PHP_MAX_CHILDREN="50"
+  PHP_START_SERVERS="2"
+  PHP_MIN_SPARE="1"
+  PHP_MAX_SPARE="4"
+  PHP_MEMORY_LIMIT="256M"
+  OPCACHE_MEM="128"
+  OPCACHE_FILES="10000"
+  NGINX_WORKER_CONNS="4096"
+  NGINX_FILE_CACHE="5000"
+  MARIADB_TABLE_OPEN_CACHE="2000"
+  MARIADB_POOL_INSTANCES="4"
+  MARIADB_THREAD_POOL_SIZE="8"
+  REDIS_IO_THREADS="2"
+else
+  # 2-4GB low-end server profile
+  INNODB_POOL="512M"
+  REDIS_MAXMEM="256M"
+  MAX_CONNS="100"
+  PHP_MAX_CHILDREN="20"
+  PHP_START_SERVERS="2"
+  PHP_MIN_SPARE="1"
+  PHP_MAX_SPARE="3"
+  PHP_MEMORY_LIMIT="128M"
+  OPCACHE_MEM="64"
+  OPCACHE_FILES="4000"
+  NGINX_WORKER_CONNS="1024"
+  NGINX_FILE_CACHE="1000"
+  MARIADB_TABLE_OPEN_CACHE="500"
+  MARIADB_POOL_INSTANCES="1"
+  MARIADB_THREAD_POOL_SIZE="2"
+  REDIS_IO_THREADS="1"
+fi
+
+info "Detected System RAM: ${TOTAL_RAM_MB}MB -> Adaptive profile applied (InnoDB: $INNODB_POOL, Redis: $REDIS_MAXMEM, PHP-Children: $PHP_MAX_CHILDREN, Nginx-Conns: $NGINX_WORKER_CONNS)"
 
 # ===========================================================================
 # 1. /ETC/NGINX/DENY.CONF HANDLING
@@ -450,7 +535,7 @@ get_php_pool_template() {
   local site_root="$3"
   local sock="$4"
   cat <<EOF
-; Managed by server.sh – do not edit manually
+; Managed by server.sh – do not edit manually (RAM-adaptive)
 [${pool_name}]
 user  = ${site_user}
 group = ${site_user}
@@ -460,10 +545,10 @@ listen.group = nginx
 listen.mode  = 0660
 
 pm = dynamic
-pm.max_children = 100
-pm.start_servers = 4
-pm.min_spare_servers = 2
-pm.max_spare_servers = 8
+pm.max_children = ${PHP_MAX_CHILDREN}
+pm.start_servers = ${PHP_START_SERVERS}
+pm.min_spare_servers = ${PHP_MIN_SPARE}
+pm.max_spare_servers = ${PHP_MAX_SPARE}
 pm.max_requests = 500
 pm.process_idle_timeout = 10s
 
@@ -473,7 +558,7 @@ php_admin_flag[allow_url_fopen]    = off
 php_admin_flag[allow_url_include]  = off
 php_admin_value[session.save_path] = ${site_root}/sessions
 php_admin_value[upload_tmp_dir]    = ${site_root}/tmp
-php_admin_value[memory_limit]      = 256M
+php_admin_value[memory_limit]      = ${PHP_MEMORY_LIMIT}
 php_admin_value[max_execution_time]= 60
 php_admin_value[max_input_time]    = 60
 php_admin_flag[expose_php]         = off
@@ -715,6 +800,66 @@ if [[ $MODE == vhost ]]; then
 fi
 
 # ===========================================================================
+# SSH IP WHITELISTING MODE (--ssh-allow)
+# ===========================================================================
+if [[ $MODE == 'ssh-allow' ]]; then
+  section "SSH IP access restriction"
+  [[ -z "$SSH_ALLOW_IPS" ]] && die "Specify IP list: --ssh-allow IP1,IP2,..."
+
+  SSH_HARDEN_FILE="/etc/ssh/sshd_config.d/99-server-hardening.conf"
+  if [[ -f "$SSH_HARDEN_FILE" ]]; then
+    extracted_port=$(grep -E '^Port\s+[0-9]+' "$SSH_HARDEN_FILE" | awk '{print $2}')
+    [[ -n "$extracted_port" ]] && SSH_PORT="$extracted_port"
+  fi
+
+  info "Validating IP addresses..."
+  IFS=',' read -ra IP_ARRAY <<< "$SSH_ALLOW_IPS"
+  validated_ips=()
+  for ip in "${IP_ARRAY[@]}"; do
+    ip="$(echo -e "$ip" | tr -d '[:space:]')"
+    [[ -z "$ip" ]] && continue
+    
+    if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$ ]] || [[ "$ip" =~ ^([0-9a-fA-F]{0,4}:){1,7}[0-9a-fA-F]{0,4}(/[0-9]{1,3})?$ ]]; then
+      validated_ips+=("$ip")
+    else
+      die "Invalid IP address or CIDR format: '$ip'"
+    fi
+  done
+
+  (( ${#validated_ips[@]} == 0 )) && die "No valid IP addresses provided."
+
+  if ! command -v firewall-cmd &>/dev/null || ! systemctl is-active --quiet firewalld; then
+    die "firewalld is not active or installed."
+  fi
+
+  info "Configuring firewalld to restrict SSH (port $SSH_PORT) to: ${validated_ips[*]}"
+  
+  firewall-cmd --permanent --zone=public --remove-service=ssh 2>/dev/null || true
+  
+  while firewall-cmd --permanent --zone=public --query-rich-rule="rule family=ipv4 port port=\"$SSH_PORT\" protocol=tcp accept" 2>/dev/null; do
+    firewall-cmd --permanent --zone=public --remove-rich-rule="rule family=ipv4 port port=\"$SSH_PORT\" protocol=tcp accept" 2>/dev/null || true
+  done
+
+  existing_rich_rules=$(firewall-cmd --permanent --zone=public --list-rich-rules 2>/dev/null || true)
+  while IFS=read -r rule; do
+    if [[ "$rule" =~ port\ port=\"$SSH_PORT\" ]]; then
+      firewall-cmd --permanent --zone=public --remove-rich-rule="$rule" 2>/dev/null || true
+    fi
+  done <<< "$existing_rich_rules"
+
+  for ip in "${validated_ips[@]}"; do
+    fam="ipv4"
+    [[ "$ip" =~ : ]] && fam="ipv6"
+    firewall-cmd --permanent --zone=public \
+      --add-rich-rule="rule family=\"$fam\" source address=\"$ip\" port port=\"$SSH_PORT\" protocol=tcp accept" || warn "Failed to add rule for $ip"
+  done
+
+  firewall-cmd --reload >/dev/null
+  fixed "SSH access successfully restricted to: ${validated_ips[*]} on port $SSH_PORT."
+  exit 0
+fi
+
+# ===========================================================================
 # INTERACTIVE SETTINGS FOR --apply
 # ===========================================================================
 if [[ $MODE == apply ]]; then
@@ -731,6 +876,9 @@ if [[ $MODE == apply ]]; then
     warn "Invalid port – falling back to 4444."
     SSH_PORT=4444
   fi
+
+  read -rp "7. Restrict SSH access to specific IP addresses (comma-separated, leave empty for any IP): " custom_ssh_ips || true
+  SSH_ALLOW_IPS="${custom_ssh_ips:-}"
 fi
 
 # ===========================================================================
@@ -966,8 +1114,25 @@ if command -v firewall-cmd &>/dev/null; then
     firewall-cmd --permanent --zone=public --remove-service=ssh 2>/dev/null || true
     firewall-cmd --permanent --zone=public --remove-service=mdns 2>/dev/null || true
 
-    firewall-cmd --permanent --zone=public \
-      --add-rich-rule="rule family=ipv4 port port=\"${SSH_PORT}\" protocol=tcp accept" 2>/dev/null || true
+    if [[ -n "$SSH_ALLOW_IPS" ]]; then
+      IFS=',' read -ra IP_Array <<< "$SSH_ALLOW_IPS"
+      for ip in "${IP_Array[@]}"; do
+        ip="$(echo -e "$ip" | tr -d '[:space:]')"
+        [[ -z "$ip" ]] && continue
+        if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$ ]] || [[ "$ip" =~ ^([0-9a-fA-F]{0,4}:){1,7}[0-9a-fA-F]{0,4}(/[0-9]{1,3})?$ ]]; then
+          fam="ipv4"
+          [[ "$ip" =~ : ]] && fam="ipv6"
+          firewall-cmd --permanent --zone=public \
+            --add-rich-rule="rule family=\"$fam\" source address=\"$ip\" port port=\"${SSH_PORT}\" protocol=tcp accept" 2>/dev/null || true
+        else
+          warn "Skipping invalid IP format during apply: $ip"
+        fi
+      done
+      fixed "SSH firewall rules configured with specific IP whitelist."
+    else
+      firewall-cmd --permanent --zone=public \
+        --add-rich-rule="rule family=ipv4 port port=\"${SSH_PORT}\" protocol=tcp accept" 2>/dev/null || true
+    fi
 
     for p in 3306 6379 5432 11211 27017; do
       firewall-cmd --permanent --zone=public \
@@ -987,7 +1152,7 @@ if command -v firewall-cmd &>/dev/null; then
     done
 
     firewall-cmd --reload >/dev/null
-    fixed "Firewalld rules applied. Publicly reachable: SSH:$SSH_PORT, HTTP, HTTPS only."
+    fixed "Firewalld rules applied successfully."
   fi
 else
   warn "firewall-cmd not installed"
@@ -1091,37 +1256,9 @@ if [[ $INSTALL_LEMP == true && $MODE == apply ]]; then
   fixed "LEMP & Redis services started and enabled."
 fi
 
-# Compute safe RAM shares (~25% MariaDB InnoDB, ~25% Redis maxmemory)
-TOTAL_RAM_KB=$(awk '/MemTotal/ {print $2}' /proc/meminfo)
-TOTAL_RAM_MB=$((TOTAL_RAM_KB / 1024))
-
-if (( TOTAL_RAM_MB >= 24000 )); then
-  # 32GB server profile
-  INNODB_POOL="8G"
-  REDIS_MAXMEM="6G"
-  MAX_CONNS="500"
-elif (( TOTAL_RAM_MB >= 12000 )); then
-  # 16GB server profile
-  INNODB_POOL="4G"
-  REDIS_MAXMEM="3G"
-  MAX_CONNS="300"
-elif (( TOTAL_RAM_MB >= 6000 )); then
-  # 8GB server profile
-  INNODB_POOL="2G"
-  REDIS_MAXMEM="1500M"
-  MAX_CONNS="200"
-else
-  # 2-4GB low-end server profile
-  INNODB_POOL="512M"
-  REDIS_MAXMEM="256M"
-  MAX_CONNS="100"
-fi
-
-info "Detected System RAM: ${TOTAL_RAM_MB}MB. Tuned profiles -> InnoDB Buffer: $INNODB_POOL | Redis MaxMem: $REDIS_MAXMEM"
-
 if [[ $SECURE_MARIADB == true && $MODE == apply ]]; then
   write_managed /etc/my.cnf.d/99-secure-server.cnf 0644 <<EOF
-# Managed by server.sh (Optimized for high performance)
+# Managed by server.sh (RAM-optimized performance profile)
 [mysqld]
 bind-address = 127.0.0.1
 skip-networking = 0
@@ -1133,7 +1270,7 @@ long_query_time = 2
 
 max_connections = $MAX_CONNS
 max_allowed_packet = 64M
-table_open_cache = 4000
+table_open_cache = $MARIADB_TABLE_OPEN_CACHE
 innodb_buffer_pool_size = $INNODB_POOL
 innodb_log_file_size = 512M
 innodb_flush_log_at_trx_commit = 1
@@ -1147,16 +1284,14 @@ innodb_io_capacity = 4000
 innodb_io_capacity_max = 4000
 innodb_read_io_threads = 8
 innodb_write_io_threads = 8
-innodb_buffer_pool_instances = 8
+innodb_buffer_pool_instances = $MARIADB_POOL_INSTANCES
 
 thread_handling = pool-of-threads
-thread_pool_size = 16
+thread_pool_size = $MARIADB_THREAD_POOL_SIZE
 thread_pool_max_threads = 2000
 innodb_thread_concurrency = 0
 
-local_infile = 0
 skip-name-resolve
-max_allowed_packet = 64M
 tmp_table_size = 64M
 max_heap_table_size = 64M
 EOF
@@ -1174,7 +1309,7 @@ fi
 
 if [[ $INSTALL_LEMP == true && $MODE == apply ]]; then
   write_managed /etc/redis/redis.conf 0644 <<EOF
-# Managed by server.sh (High-security & Performance Redis Config)
+# Managed by server.sh (High-security & Performance RAM-tuned Redis Config)
 bind 127.0.0.1 -::1
 protected-mode yes
 port 6379
@@ -1190,8 +1325,7 @@ rename-command FLUSHDB ""
 rename-command CONFIG ""
 rename-command KEYS ""
 rename-command DEBUG ""
-tcp-backlog 4096
-tcp-keepalive 300
+io-threads $REDIS_IO_THREADS
 io-threads 8
 io-threads-do-reads yes
 activedefrag yes
@@ -1219,8 +1353,8 @@ section '8. Nginx Hardening & Custom WAF Rules Integration'
 if [[ $HARDEN_NGINX_PHP == true && $MODE == apply ]]; then
   dnf install -y nginx-mod-http-brotli 2>/dev/null || true
 
-  write_managed /etc/nginx/nginx.conf 0644 <<'EOF'
-# Managed by server.sh
+  write_managed /etc/nginx/nginx.conf 0644 <<EOF
+# Managed by server.sh (RAM-adaptive)
 user nginx;
 worker_processes auto;
 error_log /var/log/nginx/error.log warn;
@@ -1229,7 +1363,7 @@ pid /run/nginx.pid;
 include /usr/share/nginx/modules/*.conf;
 
 events {
-    worker_connections 8192;
+    worker_connections $NGINX_WORKER_CONNS;
     multi_accept on;
     use epoll;
 }
@@ -1238,10 +1372,10 @@ http {
     include       /etc/nginx/mime.types;
     default_type  application/octet-stream;
 
-    log_format main '$remote_addr - $remote_user [$time_local] "$request" '
-                    '$status $body_bytes_sent "$http_referer" '
-                    '"$http_user_agent" rt=$request_time '
-                    'ua="$upstream_addr" us="$upstream_status"';
+    log_format main '\$remote_addr - \$remote_user [\$time_local] "\$request" '
+                    '\$status \$body_bytes_sent "\$http_referer" '
+                    '"\$http_user_agent" rt=\$request_time '
+                    'ua="\$upstream_addr" us="\$upstream_status"';
 
     access_log /var/log/nginx/access.log main;
     error_log  /var/log/nginx/error.log warn;
@@ -1272,7 +1406,7 @@ http {
 
     ssl_buffer_size 4k;
 
-    open_file_cache max=10000 inactive=60s;
+    open_file_cache max=$NGINX_FILE_CACHE inactive=60s;
     open_file_cache_valid 30s;
     open_file_cache_min_uses 2;
     open_file_cache_errors on;
@@ -1304,8 +1438,8 @@ http {
     ssl_stapling              on;
     ssl_stapling_verify       on;
 
-    limit_req_zone  $binary_remote_addr zone=req_per_ip:10m rate=10r/s;
-    limit_conn_zone $binary_remote_addr zone=conn_per_ip:10m;
+    limit_req_zone  \$binary_remote_addr zone=req_per_ip:10m rate=10r/s;
+    limit_conn_zone \$binary_remote_addr zone=conn_per_ip:10m;
 
     server {
         listen 80 default_server;
@@ -1314,7 +1448,7 @@ http {
     }
 
     # === WAF GEO & MAP BLOCKS ===
-    geo $is_bad_ip {
+    geo \$is_bad_ip {
         default         0;
         127.0.0.1       1;
         0.0.0.0         1;
@@ -1325,35 +1459,35 @@ http {
         169.254.0.0/16  1;
     }
 
-    geo $is_bad_subnet {
+    geo \$is_bad_subnet {
         default 0;
         include /etc/nginx/deny.conf;
     }
 
-    map $uri $is_bad_probe {
+    map \$uri \$is_bad_probe {
         default 0;
-        ~*^/.*\.(flv|mpg|mpeg|wmv|avi|asf|rm|ram)$ 1;
-        ~*/(?:wp-load|wp-activate|xmlrpc|wp-cron|wp-config|wp-configs)\.php(?:\?.*)?$ 1;
-        ~*^/(?:api/v1|v1/courses|engine/classes/min)(?:/|$) 1;
-        ~*^/(?:info|phpinfo|pinfo|xmlrpc|info|lite|about|wp|bolt|file|rip|cache|themes|abc|wpb|as|a|i|l|o|q|past|qq|p|w|x|u|adminer|inputs|adminfuns|alpha|alfacgiapi|BDKR28WP|bengi|gettest|x1da|ftde|less|oij98gy|turkshell|php|php8|kikikoko|fine|ass|zample|goods|bless4|fvvff|hplfuns|no18|byrgo|2026w|bthil|sadcut1|w2025|xqq|plss3|sbhu|file48|cabs|chosen|xwx1|class20|file18|file21|class19|simple|alfashell|motu|gssdd|bal|prv8|abcd|makeasmtp|hhxc|wkogn|ws80|fetch|eFpU3yHnriNNLtvdefault|oircv|xltt|4GrJSiwkF3A|hwjtry0zd1fzeakcuzn8Cdefault|cilus|oLEzRVqmJJPFSucdefault|wwdgl|option|num|nine2code|BhqKs28Cw94|3Cr1w6dfjTK|beerd|blnux|2nzyHnOkEg|7logs|maintura|wxeyc|n3yUmQ6Q9xwQ8ocdefault|fyflv|Geforces3FiyJ2WGCnF0p1default|p14rAeWytPdH5hZcscCFdefault|iee52ruz0s81ndrdefault|nvwf4svpvqohxdjtbjCdefault|xxiviLDIot|upll22|5tdwvyWnTbRiMS8f18HXNBbALHKB5t4j|CDX1|gvg1bvpsgtot1rpklCdefault|tx79|wtiiy|Sanskrit|amax|jga|ta0ol|classwithtostring|gecko|xmrlpc|byp403|bypass|byps|atomlib|anonsec|anons79|alfanew|alwso|alfa123|batm|autoload|compat|dropdown|db|docindex|doc|dev|eagle|exploit|evil|fierza|hello|idx|haxor|green|flame|foxx|filemanager|indoxploit|jindex|install|leaf|mail|MARIJUANA|minishellfile2|moon|anon|base|black|config|content|xleet|radio|qindex|readme|send|seo|shx|shl|unknown|upfile|tinyfilemanager|vuln|plugins|wso|about|zone|gelay|mrjn|priv|root|style|symlink|upgrade|flower|lock360|wsanon)(?:\.php.*)?$ 1;
-        ~*^/(?:_?phpinfo(?:\.php.*)?|server-info)$ 1;
+        ~*^/.*\.(flv|mpg|mpeg|wmv|avi|asf|rm|ram)\$ 1;
+        ~*/(?:wp-load|wp-activate|xmlrpc|wp-cron|wp-config|wp-configs)\.php(?:\?.*)?\$ 1;
+        ~*^/(?:api/v1|v1/courses|engine/classes/min)(?:/|\$) 1;
+        ~*^/(?:info|phpinfo|pinfo|xmlrpc|info|lite|about|wp|bolt|file|rip|cache|themes|abc|wpb|as|a|i|l|o|q|past|qq|p|w|x|u|adminer|inputs|adminfuns|alpha|alfacgiapi|BDKR28WP|bengi|gettest|x1da|ftde|less|oij98gy|turkshell|php|php8|kikikoko|fine|ass|zample|goods|bless4|fvvff|hplfuns|no18|byrgo|2026w|bthil|sadcut1|w2025|xqq|plss3|sbhu|file48|cabs|chosen|xwx1|class20|file18|file21|class19|simple|alfashell|motu|gssdd|bal|prv8|abcd|makeasmtp|hhxc|wkogn|ws80|fetch|eFpU3yHnriNNLtvdefault|oircv|xltt|4GrJSiwkF3A|hwjtry0zd1fzeakcuzn8Cdefault|cilus|oLEzRVqmJJPFSucdefault|wwdgl|option|num|nine2code|BhqKs28Cw94|3Cr1w6dfjTK|beerd|blnux|2nzyHnOkEg|7logs|maintura|wxeyc|n3yUmQ6Q9xwQ8ocdefault|fyflv|Geforces3FiyJ2WGCnF0p1default|p14rAeWytPdH5hZcscCFdefault|iee52ruz0s81ndrdefault|nvwf4svpvqohxdjtbjCdefault|xxiviLDIot|upll22|5tdwvyWnTbRiMS8f18HXNBbALHKB5t4j|CDX1|gvg1bvpsgtot1rpklCdefault|tx79|wtiiy|Sanskrit|amax|jga|ta0ol|classwithtostring|gecko|xmrlpc|byp403|bypass|byps|atomlib|anonsec|anons79|alfanew|alwso|alfa123|batm|autoload|compat|dropdown|db|docindex|doc|dev|eagle|exploit|evil|fierza|hello|idx|haxor|green|flame|foxx|filemanager|indoxploit|jindex|install|leaf|mail|MARIJUANA|minishellfile2|moon|anon|base|black|config|content|xleet|radio|qindex|readme|send|seo|shx|shl|unknown|upfile|tinyfilemanager|vuln|plugins|wso|about|zone|gelay|mrjn|priv|root|style|symlink|upgrade|flower|lock360|wsanon)(?:\.php.*)?\$ 1;
+        ~*^/(?:_?phpinfo(?:\.php.*)?|server-info)\$ 1;
         ~*^/(?:wp-admin|wp-config|gecko-new|autoload_classmap|gravitysmtp-settings|wp-fmfile|wpsite|old|wp|main|new|test|shop|wp-content|swagger|webjars|v2|v3|debug|wp-includes|console|backup|wordpress|cms|checkout|cart|loader|panel|laravel|administrator|adminstrator|server|yii|zend|vendor|rss|feed|blog|fileupload|tinymce|webroot|editor|filemanager|ckeditor|kcfinder|assets|asset|blog|plugins|cgi-bin)/ 1;
-        ~*^/(?:wp-access|wp-conctent|wp-atom|wp-files|wp-mails|wp-trackback|wp-signup|wp-blog|wp-update|wp-login|wpsite)(?:\.php.*)?$ 1;
-        ~*^/(?:config|configuration|settings|database|secrets|webresource)(?:\.(?:php|json|ini|yml|yaml|axd).*)?$ 1;
-        ~*^/.+/(?:config|configuration|settings|database|secrets|webresource)(?:\.(?:php|json|ini|yml|yaml|axd).*)?$ 1;
-        ~*^/\.env(?:[._-].*)?$ 1;
-        ~*^/.+/\.(?:env)(?:[._-].*)?$ 1;
-        ~*^/\.aws/(?:credentials|config).*$ 1;
-        ~*^/\.(?:git|bzr|pgpass|gitconfig|git-credentials|ftpconfig|ssh|cache|dockerignore|boto|amplifyrc|axd)(?:/|$) 1;
-        ~*^/(?:storage/logs/laravel\.log|bootstrap/cache/config\.php|bin/login|xwiki/bin|composer\.lock|server\.key)$ 1;
+        ~*^/(?:wp-access|wp-conctent|wp-atom|wp-files|wp-mails|wp-trackback|wp-signup|wp-blog|wp-update|wp-login|wpsite)(?:\.php.*)?\$ 1;
+        ~*^/(?:config|configuration|settings|database|secrets|webresource)(?:\.(?:php|json|ini|yml|yaml|axd).*)?\$ 1;
+        ~*^/.+/(?:config|configuration|settings|database|secrets|webresource)(?:\.(?:php|json|ini|yml|yaml|axd).*)?\$ 1;
+        ~*^/\.env(?:[._-].*)?\$ 1;
+        ~*^/.+/\.(?:env)(?:[._-].*)?\$ 1;
+        ~*^/\.aws/(?:credentials|config).*\$ 1;
+        ~*^/\.(?:git|bzr|pgpass|gitconfig|git-credentials|ftpconfig|ssh|cache|dockerignore|boto|amplifyrc|axd)(?:/|\$) 1;
+        ~*^/(?:storage/logs/laravel\.log|bootstrap/cache/config\.php|bin/login|xwiki/bin|composer\.lock|server\.key)\$ 1;
         ~*(isMatchIgnored|toUpperCase|addSublanguage|toLowerCase|XWikiLogin|closeAllNodes|redirect_probe|redirect_base|abn_shadow|mcp_token|xhr_content|iscssurlinjected|telerik|websocket|shark_bite|rest_route|absolute_url_processed|message_markdown_url|use_xbridge3|product_oosn) 1;
     }
 
-    map $http_user_agent $is_bad_ua {
+    map \$http_user_agent \$is_bad_ua {
         default 0;
         ""              1;
-        "~^.{0,12}$"    1;
-        "~^.{450,}$"    1;
+        "~^.{0,12}\$"    1;
+        "~^.{450,}\$"    1;
         "~*\""          1;
         "~*(bingbot|googlebot|yandexbot|applebot|duckduckbot|coccocbot)" 0;
         "~*(spider_bot|xaldon|wayback_machine|adbeat(_bot|\.com)|commoncrawl|bidtellect|pwaminicanvas|rddocuments|sonic|spotify|atcontent|falcontag|bullettag|openwave|kyvys|thunder|metaiab|jssdk|bytelocale|acvxyjv|voxelum|sessionid|minecraft|cachepos|vxldsihsp|sitecheck|sitecrawl|cherrystudio|opengraph|alamofire|qtwebengine|aippy|v2raytun|liebaofast|undici|deepseek|arenaunfurl|businessname|activedomaincollector|celturbo|imagefetcher|cravingexplorer|oai-search|adint-transparency|manus-user|wap-|check-access|wp-|dnt-policy|pr-cy|3gpp-gba|rwth-aachen|iab-tech|ttd-content|psi-exam|cms-checker|gvfs/|ptst/|boring-searchbot|unity)" 1;
@@ -1364,7 +1498,7 @@ http {
         "~*(arena\.ai|bot\.ai|visionheight\.com|bnf\.fr|leak\.info|moz\.com|iprojects\.ru|snap\.com|larus\.wolf|umich\.edu|mmcdn\.com|xmcl\.app|archive\.org|seolik\.ru)" 1;
     }
 
-    map $request_method $is_bad_method {
+    map \$request_method \$is_bad_method {
         default 1;
         GET    0;
         HEAD   0;
@@ -1375,8 +1509,8 @@ http {
 }
 EOF
 
-  write_managed /etc/php.d/99-security.ini 0644 <<'EOF'
-; Managed by server.sh
+  write_managed /etc/php.d/99-security.ini 0644 <<EOF
+; Managed by server.sh (RAM-adaptive OPcache & security settings)
 expose_php = Off
 display_errors = Off
 display_startup_errors = Off
@@ -1393,16 +1527,16 @@ session.use_only_cookies = 1
 session.sid_length = 48
 session.sid_bits_per_character = 6
 session.upload_progress.enabled = Off
-opcache.memory_consumption = 256
+opcache.memory_consumption = ${OPCACHE_MEM}
 opcache.interned_strings_buffer = 32
-opcache.max_accelerated_files = 20000
+opcache.max_accelerated_files = ${OPCACHE_FILES}
 opcache.validate_timestamps = 0
 opcache.revalidate_freq = 0
 opcache.jit = 1255
 opcache.jit_buffer_size = 64M
 EOF
   systemctl reload php-fpm 2>/dev/null || true
-  fixed "Global PHP security settings applied."
+  fixed "Global PHP security & RAM-adapted OPcache settings applied."
 fi
 
 # ===========================================================================
@@ -1544,15 +1678,15 @@ if [[ $MODE == apply ]]; then
   info ""
   info "IMPORTANT REMINDERS:"
   info "  1. SSH port set to $SSH_PORT. Test connectivity in another window before exit."
-  info "  2. Virtual host CLI usage:"
+  info "  2. Restrict SSH IPs anytime via: sudo $0 --ssh-allow 192.168.1.50,10.0.0.5"
+  info "  3. Virtual host CLI usage:"
   info "       sudo $0 --vhost-add domain.tld --type php"
   info "       sudo $0 --vhost-del domain.tld"
   info "       sudo $0 --vhost-list"
-  info "  3. Database CLI usage:"
+  info "  4. Database CLI usage:"
   info "       sudo $0 --db-add --db-name appname"
   info "       sudo $0 --db-del --db-name appname"
   info "       sudo $0 --db-list"
-  info "  4. Reboot recommended for kernel arguments and module blacklists."
 else
   info "Audit finished. No changes were made."
   info "To apply hardening run: sudo $0 --apply"
