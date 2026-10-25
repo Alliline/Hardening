@@ -17,7 +17,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-VERSION='2.3'
+VERSION='2.4'
 MODE='audit'
 FORCE_SSH_KEEP=true          # set to false if you really want to remove SSH from public zone
 AGGRESSIVE_USERNS=false      # set to true to disable unprivileged user namespaces (breaks Flatpak/Podman rootless)
@@ -1920,7 +1920,6 @@ if [[ $INSTALL_HARDENED_MALLOC == true ]]; then
     section '18.1. Flatpak Global + Per-App Strict Sandbox'
 
     if [[ $MODE == apply ]]; then
-      # Глобальный дефолт: hardened_malloc + минимальные права
       sudo -u "$REAL_USER" flatpak override --user \
         --filesystem="$LIB_DEST":ro \
         --env=LD_PRELOAD="$LIB_DEST" \
@@ -1944,7 +1943,6 @@ if [[ $INSTALL_HARDENED_MALLOC == true ]]; then
         2>/dev/null || true
       fixed "Global Flatpak defaults applied (hardened_malloc + strict base)"
 
-      # Браузеры (самый опасный вектор)
       for browser in \
         org.mozilla.firefox \
         org.chromium.Chromium \
@@ -1957,12 +1955,12 @@ if [[ $INSTALL_HARDENED_MALLOC == true ]]; then
             --nodevice=all \
             --nofilesystem=host \
             --nofilesystem=home \
-            --nofilesystem=xdg-download \
             --nofilesystem=xdg-documents \
             --nofilesystem=xdg-pictures \
             --nofilesystem=xdg-videos \
             --nofilesystem=xdg-music \
             --nofilesystem=xdg-desktop \
+            --filesystem=xdg-download \
             --persist=xdg-config \
             --persist=xdg-data \
             --share=network \
@@ -1977,14 +1975,12 @@ if [[ $INSTALL_HARDENED_MALLOC == true ]]; then
         fi
       done
 
-      # KeePassXC — нужен доступ к secrets и иногда к файлам
       if sudo -u "$REAL_USER" flatpak info org.keepassxc.KeePassXC &>/dev/null; then
         sudo -u "$REAL_USER" flatpak override --user org.keepassxc.KeePassXC \
           --nosocket=x11 \
           --nodevice=all \
           --nofilesystem=host \
           --filesystem=xdg-documents:rw \
-          --filesystem=xdg-download:rw \
           --persist=xdg-config \
           --share=network \
           --socket=wayland \
@@ -1995,7 +1991,6 @@ if [[ $INSTALL_HARDENED_MALLOC == true ]]; then
         fixed "KeePassXC sandbox tightened"
       fi
 
-      # Telegram
       if sudo -u "$REAL_USER" flatpak info org.telegram.desktop &>/dev/null; then
         sudo -u "$REAL_USER" flatpak override --user org.telegram.desktop \
           --nosocket=x11 \
@@ -2003,6 +1998,7 @@ if [[ $INSTALL_HARDENED_MALLOC == true ]]; then
           --nofilesystem=host \
           --filesystem=xdg-download:rw \
           --filesystem=xdg-pictures:rw \
+          --filesystem=xdg-videos:rw \
           --persist=xdg-config \
           --persist=xdg-data \
           --share=network \
@@ -2015,14 +2011,12 @@ if [[ $INSTALL_HARDENED_MALLOC == true ]]; then
         fixed "Telegram sandbox tightened"
       fi
 
-      # FileZilla
       if sudo -u "$REAL_USER" flatpak info org.filezillaproject.Filezilla &>/dev/null; then
         sudo -u "$REAL_USER" flatpak override --user org.filezillaproject.Filezilla \
           --nosocket=x11 \
           --nodevice=all \
           --nofilesystem=host \
           --filesystem=xdg-download:rw \
-          --filesystem=xdg-documents:rw \
           --persist=xdg-config \
           --share=network \
           --socket=wayland \
@@ -2031,7 +2025,6 @@ if [[ $INSTALL_HARDENED_MALLOC == true ]]; then
         fixed "FileZilla sandbox tightened"
       fi
 
-      # GIMP
       if sudo -u "$REAL_USER" flatpak info org.gimp.GIMP &>/dev/null; then
         sudo -u "$REAL_USER" flatpak override --user org.gimp.GIMP \
           --nosocket=x11 \
@@ -2039,7 +2032,6 @@ if [[ $INSTALL_HARDENED_MALLOC == true ]]; then
           --nofilesystem=host \
           --filesystem=xdg-pictures:rw \
           --filesystem=xdg-download:rw \
-          --filesystem=xdg-documents:rw \
           --persist=xdg-config \
           --socket=wayland \
           --env=LD_PRELOAD="$LIB_DEST" \
@@ -2047,7 +2039,6 @@ if [[ $INSTALL_HARDENED_MALLOC == true ]]; then
         fixed "GIMP sandbox tightened"
       fi
 
-      # qBittorrent
       if sudo -u "$REAL_USER" flatpak info org.qbittorrent.qBittorrent &>/dev/null; then
         sudo -u "$REAL_USER" flatpak override --user org.qbittorrent.qBittorrent \
           --nosocket=x11 \
@@ -2063,7 +2054,6 @@ if [[ $INSTALL_HARDENED_MALLOC == true ]]; then
         fixed "qBittorrent sandbox tightened"
       fi
 
-      # Sublime Text
       if sudo -u "$REAL_USER" flatpak info com.sublimehq.SublimeText &>/dev/null; then
         sudo -u "$REAL_USER" flatpak override --user com.sublimehq.SublimeText \
           --nosocket=x11 \
@@ -2079,7 +2069,6 @@ if [[ $INSTALL_HARDENED_MALLOC == true ]]; then
         fixed "Sublime Text sandbox tightened"
       fi
 
-      # Flatseal — оставляем чуть шире, иначе им нельзя будет управлять
       if sudo -u "$REAL_USER" flatpak info com.github.tchx84.Flatseal &>/dev/null; then
         sudo -u "$REAL_USER" flatpak override --user com.github.tchx84.Flatseal \
           --nosocket=x11 \
