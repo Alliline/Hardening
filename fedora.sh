@@ -17,7 +17,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-VERSION='2.2'
+VERSION='2.3'
 MODE='audit'
 FORCE_SSH_KEEP=true          # set to false if you really want to remove SSH from public zone
 AGGRESSIVE_USERNS=false      # set to true to disable unprivileged user namespaces (breaks Flatpak/Podman rootless)
@@ -1917,75 +1917,184 @@ if [[ $INSTALL_HARDENED_MALLOC == true ]]; then
   fi
 
   if command -v flatpak &>/dev/null; then
-    section '18.1. Flatpak Global System Defaults & Sandbox Hardening'
+    section '18.1. Flatpak Global + Per-App Strict Sandbox'
 
     if [[ $MODE == apply ]]; then
-      info "Applying default Flatpak override for hardened_malloc (overridable via Flatseal)..."
+      # Глобальный дефолт: hardened_malloc + минимальные права
       sudo -u "$REAL_USER" flatpak override --user \
         --filesystem="$LIB_DEST":ro \
-        --env=LD_PRELOAD="$LIB_DEST"
-      fixed "Default Flatpak policy set: LD_PRELOAD enabled for all apps (customizable in Flatseal)."
-    else
-      info "Would apply default Flatpak override for hardened_malloc (mode: audit)"
-    fi
+        --env=LD_PRELOAD="$LIB_DEST" \
+        --nosocket=x11 \
+        --nosocket=session-bus \
+        --nodevice=all \
+        --nofilesystem=host \
+        --nofilesystem=home \
+        --nofilesystem=xdg-download \
+        --nofilesystem=xdg-documents \
+        --nofilesystem=xdg-pictures \
+        --nofilesystem=xdg-videos \
+        --nofilesystem=xdg-music \
+        --share=network \
+        --share=ipc \
+        --socket=wayland \
+        --socket=pulseaudio \
+        --talk-name=org.freedesktop.Notifications \
+        --talk-name=org.freedesktop.secrets \
+        --talk-name=org.freedesktop.portal.* \
+        2>/dev/null || true
+      fixed "Global Flatpak defaults applied (hardened_malloc + strict base)"
 
-    mapfile -t installed_flatpaks < <(sudo -u "$REAL_USER" flatpak list --app --columns=application 2>/dev/null || true)
-    
-    if (( ${#installed_flatpaks[@]} > 0 )); then
-      info "Auditing and enforcing strict sandbox defaults on ${#installed_flatpaks[@]} installed Flatpak app(s)..."
-      
-      for app in "${installed_flatpaks[@]}"; do
-        app_info=$(sudo -u "$REAL_USER" flatpak info --show-permissions "$app" 2>/dev/null || true)
-        
-        has_x11=false
-        has_host_fs=false
-        has_full_device=false
-        has_session_bus=false
-        
-        if grep -qE 'sockets=.*x11' <<< "$app_info"; then has_x11=true; fi
-        if grep -qE 'filesystems=.*;host' <<< "$app_info" || grep -qE 'filesystems=full' <<< "$app_info"; then has_host_fs=true; fi
-        if grep -qE 'devices=all' <<< "$app_info"; then has_full_device=true; fi
-        if grep -qE 'sockets=.*session-bus' <<< "$app_info"; then has_session_bus=true; fi
-
-        override_args=(override --user)
-
-        [[ $has_x11 == true ]] &&
-          override_args+=(--nosocket=x11)
-
-        [[ $has_host_fs == true ]] &&
-          override_args+=(--nofilesystem=host)
-
-        [[ $has_full_device == true ]] &&
-          override_args+=(--nodevice=all)
-
-        [[ $has_session_bus == true ]] &&
-          override_args+=(--nosocket=session-bus)
-
-        if [[ $MODE == apply ]]; then
-          if [[ $has_x11 == true || $has_host_fs == true ||
-                $has_full_device == true || $has_session_bus == true ]]; then
-
-            if sudo -u "$REAL_USER" flatpak "${override_args[@]}" "$app"; then
-              fixed "Revoked selected broad permissions for: $app"
-            else
-              warn "Failed to revoke permissions for: $app"
-            fi
-          fi
-        else
-          if [[ $has_x11 == true || $has_host_fs == true ||
-                $has_full_device == true || $has_session_bus == true ]]; then
-            warn "App '$app' currently has broad permissions (will be restricted on --apply):"
-            [[ $has_x11 == true ]]         && info "    - Uses X11 socket"
-            [[ $has_host_fs == true ]]     && info "    - Host filesystem access"
-            [[ $has_full_device == true ]] && info "    - Full device access"
-            [[ $has_session_bus == true ]] && info "    - Session D-Bus access"
-          else
-            ok "App '$app': sandbox is isolated."
-          fi
+      # Браузеры (самый опасный вектор)
+      for browser in \
+        org.mozilla.firefox \
+        org.chromium.Chromium \
+        io.github.ungoogled_software.ungoogled_chromium
+      do
+        if sudo -u "$REAL_USER" flatpak info "$browser" &>/dev/null; then
+          sudo -u "$REAL_USER" flatpak override --user "$browser" \
+            --nosocket=x11 \
+            --nosocket=session-bus \
+            --nodevice=all \
+            --nofilesystem=host \
+            --nofilesystem=home \
+            --nofilesystem=xdg-download \
+            --nofilesystem=xdg-documents \
+            --nofilesystem=xdg-pictures \
+            --nofilesystem=xdg-videos \
+            --nofilesystem=xdg-music \
+            --nofilesystem=xdg-desktop \
+            --persist=xdg-config \
+            --persist=xdg-data \
+            --share=network \
+            --socket=wayland \
+            --socket=pulseaudio \
+            --talk-name=org.freedesktop.Notifications \
+            --talk-name=org.freedesktop.secrets \
+            --talk-name=org.freedesktop.portal.* \
+            --env=LD_PRELOAD="$LIB_DEST" \
+            2>/dev/null || true
+          fixed "Strict browser sandbox applied: $browser"
         fi
       done
+
+      # KeePassXC — нужен доступ к secrets и иногда к файлам
+      if sudo -u "$REAL_USER" flatpak info org.keepassxc.KeePassXC &>/dev/null; then
+        sudo -u "$REAL_USER" flatpak override --user org.keepassxc.KeePassXC \
+          --nosocket=x11 \
+          --nodevice=all \
+          --nofilesystem=host \
+          --filesystem=xdg-documents:rw \
+          --filesystem=xdg-download:rw \
+          --persist=xdg-config \
+          --share=network \
+          --socket=wayland \
+          --talk-name=org.freedesktop.secrets \
+          --talk-name=org.freedesktop.Notifications \
+          --env=LD_PRELOAD="$LIB_DEST" \
+          2>/dev/null || true
+        fixed "KeePassXC sandbox tightened"
+      fi
+
+      # Telegram
+      if sudo -u "$REAL_USER" flatpak info org.telegram.desktop &>/dev/null; then
+        sudo -u "$REAL_USER" flatpak override --user org.telegram.desktop \
+          --nosocket=x11 \
+          --nodevice=all \
+          --nofilesystem=host \
+          --filesystem=xdg-download:rw \
+          --filesystem=xdg-pictures:rw \
+          --persist=xdg-config \
+          --persist=xdg-data \
+          --share=network \
+          --socket=wayland \
+          --socket=pulseaudio \
+          --talk-name=org.freedesktop.Notifications \
+          --talk-name=org.freedesktop.secrets \
+          --env=LD_PRELOAD="$LIB_DEST" \
+          2>/dev/null || true
+        fixed "Telegram sandbox tightened"
+      fi
+
+      # FileZilla
+      if sudo -u "$REAL_USER" flatpak info org.filezillaproject.Filezilla &>/dev/null; then
+        sudo -u "$REAL_USER" flatpak override --user org.filezillaproject.Filezilla \
+          --nosocket=x11 \
+          --nodevice=all \
+          --nofilesystem=host \
+          --filesystem=xdg-download:rw \
+          --filesystem=xdg-documents:rw \
+          --persist=xdg-config \
+          --share=network \
+          --socket=wayland \
+          --env=LD_PRELOAD="$LIB_DEST" \
+          2>/dev/null || true
+        fixed "FileZilla sandbox tightened"
+      fi
+
+      # GIMP
+      if sudo -u "$REAL_USER" flatpak info org.gimp.GIMP &>/dev/null; then
+        sudo -u "$REAL_USER" flatpak override --user org.gimp.GIMP \
+          --nosocket=x11 \
+          --nodevice=all \
+          --nofilesystem=host \
+          --filesystem=xdg-pictures:rw \
+          --filesystem=xdg-download:rw \
+          --filesystem=xdg-documents:rw \
+          --persist=xdg-config \
+          --socket=wayland \
+          --env=LD_PRELOAD="$LIB_DEST" \
+          2>/dev/null || true
+        fixed "GIMP sandbox tightened"
+      fi
+
+      # qBittorrent
+      if sudo -u "$REAL_USER" flatpak info org.qbittorrent.qBittorrent &>/dev/null; then
+        sudo -u "$REAL_USER" flatpak override --user org.qbittorrent.qBittorrent \
+          --nosocket=x11 \
+          --nodevice=all \
+          --nofilesystem=host \
+          --filesystem=xdg-download:rw \
+          --persist=xdg-config \
+          --persist=xdg-data \
+          --share=network \
+          --socket=wayland \
+          --env=LD_PRELOAD="$LIB_DEST" \
+          2>/dev/null || true
+        fixed "qBittorrent sandbox tightened"
+      fi
+
+      # Sublime Text
+      if sudo -u "$REAL_USER" flatpak info com.sublimehq.SublimeText &>/dev/null; then
+        sudo -u "$REAL_USER" flatpak override --user com.sublimehq.SublimeText \
+          --nosocket=x11 \
+          --nodevice=all \
+          --nofilesystem=host \
+          --filesystem=xdg-documents:rw \
+          --filesystem=xdg-download:rw \
+          --persist=xdg-config \
+          --persist=xdg-data \
+          --socket=wayland \
+          --env=LD_PRELOAD="$LIB_DEST" \
+          2>/dev/null || true
+        fixed "Sublime Text sandbox tightened"
+      fi
+
+      # Flatseal — оставляем чуть шире, иначе им нельзя будет управлять
+      if sudo -u "$REAL_USER" flatpak info com.github.tchx84.Flatseal &>/dev/null; then
+        sudo -u "$REAL_USER" flatpak override --user com.github.tchx84.Flatseal \
+          --nosocket=x11 \
+          --nodevice=all \
+          --nofilesystem=host \
+          --persist=xdg-config \
+          --socket=wayland \
+          --talk-name=org.freedesktop.Flatpak \
+          --env=LD_PRELOAD="$LIB_DEST" \
+          2>/dev/null || true
+        fixed "Flatseal sandbox applied"
+      fi
+
     else
-      info "No Flatpak apps currently installed to audit."
+      info "Would apply strict global + per-app Flatpak overrides (mode: audit)"
     fi
   else
     info "Flatpak is not installed; skipping Flatpak integration."
