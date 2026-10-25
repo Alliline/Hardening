@@ -17,7 +17,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-VERSION='2.1'
+VERSION='2.2'
 MODE='audit'
 FORCE_SSH_KEEP=true          # set to false if you really want to remove SSH from public zone
 AGGRESSIVE_USERNS=false      # set to true to disable unprivileged user namespaces (breaks Flatpak/Podman rootless)
@@ -853,6 +853,9 @@ KARGS_CORE=(
   tsx=off
   debugfs=off
   kvm.nx_huge_pages=force
+  spectre_v2_user=on
+  spec_rstack_overflow=safe-ret
+  l1tf=full,force
 )
 
 KARGS_EXTRA=(
@@ -972,6 +975,32 @@ services_to_mask=(
   pcscd.service
   ModemManager.service
   geoclue.service
+  rpcbind.service
+  nfs-client.target
+  nfs-server.service
+  rpc-statd.service
+  rpc-gssd.service
+  rpc-svcgssd.service
+  gssproxy.service
+  mcelog.service
+  kdump.service
+  plymouth-start.service
+  plymouth-quit.service
+  plymouth-quit-wait.service
+  systemd-coredump.socket
+  systemd-coredump@.service
+  debug-shell.service
+  emergency.service
+  rescue.service
+  iscsid.service
+  iscsi.service
+  lvm2-monitor.service
+  dm-event.service
+  mdmonitor.service
+  raid-check.timer
+  hypervkvpd.service
+  hypervvssd.service
+  hypervfcopyd.service
 )
 
 for srv in "${services_to_mask[@]}"; do
@@ -1417,7 +1446,7 @@ section '12. Kernel Module Blacklisting'
 
 MODPROBE_FILE="/etc/modprobe.d/99-hardening-blacklist.conf"
 MODPROBE_CONTENT=$(cat <<'MOD_EOF'
-# Unused / legacy network protocols
+# === Completely defunct network protocols ===
 install dccp /bin/false
 install sctp /bin/false
 install rds /bin/false
@@ -1434,34 +1463,96 @@ install ipx /bin/false
 install appletalk /bin/false
 install can /bin/false
 install atm /bin/false
+install p8022 /bin/false
+install p8023 /bin/false
+install psnap /bin/false
+install n_hdlc /bin/false
+install llc /bin/false
+install bridge /bin/true
+install veth /bin/true
+install tun /bin/true
+install tap /bin/true
+install vxlan /bin/true
+install geneve /bin/true
 
-# Legacy / rarely needed filesystems (Squashfs сохранен для Flatpak)
+# === Legacy file systems (particularly dangerous during extraction) ===
 install cramfs /bin/false
 install freevxfs /bin/false
 install jffs2 /bin/false
 install hfs /bin/false
 install hfsplus /bin/false
 install udf /bin/false
+install isofs /bin/false
+install romfs /bin/false
+install sysv /bin/false
+install minix /bin/false
+install bfs /bin/false
+install qnx4 /bin/false
+install qnx6 /bin/false
+install affs /bin/false
+install efs /bin/false
+install jfs /bin/false
+install reiserfs /bin/false
+install nilfs2 /bin/false
+install f2fs /bin/false
+# We’re keeping the modern ones:
+install ext4 /bin/true
+install xfs /bin/true
+install btrfs /bin/true
+install overlay /bin/true
+install fuse /bin/true
+install vfat /bin/true
+install exfat /bin/true
+install ntfs3 /bin/true
+install squashfs /bin/true
 
-# Hardware (Thunderbolt и звук не трогаем)
+# === Legacy hardware (Z790/Z890 — none of this is present on the boards) ===
+install floppy /bin/false
+install parport /bin/false
+install parport_pc /bin/false
+install lp /bin/false
+install ppdev /bin/false
+install serial_core /bin/false
+install 8250 /bin/false
+install 8250_pci /bin/false
+install serial /bin/false
+install pcspkr /bin/false
+install joydev /bin/false
+install gameport /bin/false
+install serio_raw /bin/false
+install psmouse /bin/false
+install atkbd /bin/false
+install i8042 /bin/false
+install libps2 /bin/false
+
+# FireWire in its entirety (Thunderbolt ≠ FireWire)
 install firewire-core /bin/false
 install firewire-ohci /bin/false
 install firewire-sbp2 /bin/false
-install floppy /bin/false
+install firewire-net /bin/false
+
+# NFC / UWB / legacy buses
 install nfc /bin/false
 install uwb /bin/false
 install ssb /bin/false
 install bcma /bin/false
+install mac80211_hwsim /bin/false
 
-# Rarely used / high-risk HW buses
+# Legacy USB modem/telephony classes (retaining UAS/USB storage classes)
 install cdc_acm /bin/false
 install cdc_ether /bin/false
 install cdc_ncm /bin/false
 install cdc_mbim /bin/false
+install cdc_wdm /bin/false
+install usblp /bin/false
+install usb-storage /bin/true
+install uas /bin/true
 
-# Dangerous / rarely needed input/misc
-install joydev /bin/false
-install pcspkr /bin/false
+# Other legacy
+install mtd /bin/false
+install mtdblock /bin/false
+install nand /bin/false
+install onenand /bin/false
 MOD_EOF
 )
 
