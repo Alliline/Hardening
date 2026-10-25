@@ -17,7 +17,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-VERSION='2.0'
+VERSION='2.1'
 MODE='audit'
 FORCE_SSH_KEEP=true          # set to false if you really want to remove SSH from public zone
 AGGRESSIVE_USERNS=false      # set to true to disable unprivileged user namespaces (breaks Flatpak/Podman rootless)
@@ -834,6 +834,8 @@ fi
 # ===========================================================================
 section '1. Bootloader & Kernel Security Parameters'
 
+#lockdown=integrity
+#module.sig_enforce=1
 KARGS_CORE=(
   slab_nomerge
   init_on_alloc=1
@@ -847,6 +849,10 @@ KARGS_CORE=(
   vsyscall=none
   random.trust_cpu=off
   random.trust_bootloader=off
+  oops=panic
+  tsx=off
+  debugfs=off
+  kvm.nx_huge_pages=force
 )
 
 KARGS_EXTRA=(
@@ -964,6 +970,8 @@ services_to_mask=(
   flatpak-add-fedora-repos.service
   cups.service cups.socket cups.path
   pcscd.service
+  ModemManager.service
+  geoclue.service
 )
 
 for srv in "${services_to_mask[@]}"; do
@@ -1131,7 +1139,7 @@ section '8. Kernel Sysctl Hardening'
 SYSCTL_FILE="/etc/sysctl.d/99-secure-fedora-hardening.conf"
 
 SYSCTL_CONTENT=$(cat <<'SYSCTL_EOF'
-# Network
+# === Network (anti-recon + anti-spoof) ===
 net.ipv4.tcp_syncookies = 1
 net.ipv4.tcp_rfc1337 = 1
 net.ipv4.icmp_echo_ignore_broadcasts = 1
@@ -1139,14 +1147,12 @@ net.ipv4.icmp_ignore_bogus_error_responses = 1
 net.ipv4.icmp_echo_ignore_all = 0
 net.ipv6.icmp.echo_ignore_all = 0
 net.ipv4.tcp_timestamps = 0
-
 net.ipv4.conf.all.rp_filter = 1
 net.ipv4.conf.default.rp_filter = 1
 net.ipv4.conf.all.accept_source_route = 0
 net.ipv4.conf.default.accept_source_route = 0
 net.ipv6.conf.all.accept_source_route = 0
 net.ipv6.conf.default.accept_source_route = 0
-
 net.ipv4.conf.all.accept_redirects = 0
 net.ipv4.conf.default.accept_redirects = 0
 net.ipv4.conf.all.secure_redirects = 0
@@ -1155,16 +1161,20 @@ net.ipv4.conf.all.send_redirects = 0
 net.ipv4.conf.default.send_redirects = 0
 net.ipv6.conf.all.accept_redirects = 0
 net.ipv6.conf.default.accept_redirects = 0
-
 net.ipv4.conf.all.log_martians = 1
 net.ipv4.conf.default.log_martians = 1
 net.ipv6.conf.all.use_tempaddr = 2
 net.ipv6.conf.default.use_tempaddr = 2
+net.ipv4.tcp_fastopen = 0
+net.ipv4.conf.all.arp_ignore = 2
+net.ipv4.conf.default.arp_ignore = 2
+net.ipv4.conf.all.arp_announce = 2
+net.ipv4.conf.default.arp_announce = 2
 
-# Kernel self-protection
+# === Kernel self-protection ===
 net.core.bpf_jit_harden = 2
 kernel.unprivileged_bpf_disabled = 1
-kernel.yama.ptrace_scope = 3
+kernel.yama.ptrace_scope = 2
 kernel.kptr_restrict = 2
 kernel.dmesg_restrict = 1
 kernel.perf_event_paranoid = 3
@@ -1174,15 +1184,9 @@ kernel.io_uring_disabled = 2
 kernel.oops_limit = 100
 kernel.warn_limit = 100
 kernel.panic = -1
-
-# Filesystem
-fs.suid_dumpable = 0
-fs.protected_regular = 2
-fs.protected_fifos = 2
-fs.protected_hardlinks = 1
-fs.protected_symlinks = 1
-
-# Memory / ASLR
+kernel.panic_on_oops = 1
+kernel.panic_on_warn = 0
+kernel.modules_disabled = 0
 dev.tty.ldisc_autoload = 0
 vm.unprivileged_userfaultfd = 0
 vm.mmap_rnd_bits = 32
@@ -1190,6 +1194,25 @@ vm.mmap_rnd_compat_bits = 16
 kernel.randomize_va_space = 2
 kernel.core_pattern = |/bin/false
 kernel.printk = 3 3 3 3
+fs.suid_dumpable = 0
+fs.protected_regular = 2
+fs.protected_fifos = 2
+fs.protected_hardlinks = 1
+fs.protected_symlinks = 1
+fs.protected_symlinks_create = 1
+fs.protected_hardlinks_create = 1
+
+# === Anti-info-leak & Performance micro-tweaks ===
+kernel.pid_max = 65536
+vm.mmap_min_addr = 65536
+kernel.perf_cpu_time_max_percent = 1
+kernel.sched_schedstats = 0
+kernel.timer_migration = 0
+net.core.bpf_jit_kallsyms = 0
+kernel.ftrace_enabled = 0
+kernel.stack_tracer_enabled = 0
+net.ipv4.conf.all.mc_forwarding = 0
+net.ipv6.conf.all.mc_forwarding = 0
 SYSCTL_EOF
 )
 
@@ -1249,6 +1272,44 @@ elif [[ $MODE == apply ]]; then
   write_managed "$LIMITS_FILE" 0644 <<<"* hard core 0"$'\n'
 else
   warn "Core dump limits not set"
+fi
+
+COREDUMP_CONF="/etc/systemd/coredump.conf.d/99-nocore.conf"
+if [[ -f $COREDUMP_CONF ]] && grep -q 'Storage=none' "$COREDUMP_CONF"; then
+  ok "Systemd coredump storage disabled"
+elif [[ $MODE == apply ]]; then
+  write_managed "$COREDUMP_CONF" 0644 <<'EOF'
+[Coredump]
+Storage=none
+ProcessSizeMax=0
+EOF
+  systemctl daemon-reload 2>/dev/null || true
+  fixed "Systemd coredump disabled globally"
+else
+  warn "Systemd coredump not disabled via coredump.conf"
+fi
+
+TMP_MOUNT_CONF="/etc/systemd/system/tmp.mount.d/99-options.conf"
+if [[ $MODE == apply ]]; then
+  install -d -m 0755 "$(dirname "$TMP_MOUNT_CONF")"
+  write_managed "$TMP_MOUNT_CONF" 0644 <<'EOF'
+[Mount]
+Options=nosuid,nodev,noexec,relatime
+EOF
+  systemctl daemon-reload
+  systemctl re-enable tmp.mount 2>/dev/null || true
+  fixed "Mounted /tmp with nosuid, nodev, noexec"
+fi
+
+SHM_MOUNT_CONF="/etc/systemd/system/dev-shm.mount.d/99-options.conf"
+if [[ $MODE == apply ]]; then
+  install -d -m 0755 "$(dirname "$SHM_MOUNT_CONF")"
+  write_managed "$SHM_MOUNT_CONF" 0644 <<'EOF'
+[Mount]
+Options=nosuid,nodev,noexec,relatime,size=50%
+EOF
+  systemctl daemon-reload
+  fixed "Hardened /dev/shm (nosuid,nodev,noexec)"
 fi
 
 # ===========================================================================
@@ -1356,7 +1417,7 @@ section '12. Kernel Module Blacklisting'
 
 MODPROBE_FILE="/etc/modprobe.d/99-hardening-blacklist.conf"
 MODPROBE_CONTENT=$(cat <<'MOD_EOF'
-# Unused network protocols
+# Unused / legacy network protocols
 install dccp /bin/false
 install sctp /bin/false
 install rds /bin/false
@@ -1374,7 +1435,7 @@ install appletalk /bin/false
 install can /bin/false
 install atm /bin/false
 
-# Legacy / rarely needed filesystems
+# Legacy / rarely needed filesystems (Squashfs сохранен для Flatpak)
 install cramfs /bin/false
 install freevxfs /bin/false
 install jffs2 /bin/false
@@ -1382,9 +1443,25 @@ install hfs /bin/false
 install hfsplus /bin/false
 install udf /bin/false
 
-# Hardware that is rarely needed
+# Hardware (Thunderbolt и звук не трогаем)
 install firewire-core /bin/false
+install firewire-ohci /bin/false
+install firewire-sbp2 /bin/false
 install floppy /bin/false
+install nfc /bin/false
+install uwb /bin/false
+install ssb /bin/false
+install bcma /bin/false
+
+# Rarely used / high-risk HW buses
+install cdc_acm /bin/false
+install cdc_ether /bin/false
+install cdc_ncm /bin/false
+install cdc_mbim /bin/false
+
+# Dangerous / rarely needed input/misc
+install joydev /bin/false
+install pcspkr /bin/false
 MOD_EOF
 )
 
