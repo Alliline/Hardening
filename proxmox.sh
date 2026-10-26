@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # Proxmox VE 9.2 (Debian 13 Trixie) Ultimate Security Hardening & Performance
 # Compatible with PVE 9.2+ (Kernel 6.14+ / AMD Strix Point)
+
 set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-VERSION='1.0'
+VERSION='1.1'
 MODE='audit'
 
-# Значения по умолчанию (будут перезаписаны из конфига, если он есть)
 SETUP_ADMIN_USER=true
 ADMIN_USER="proxadmin"
 SSH_PORT=4444
@@ -23,9 +23,7 @@ SETUP_FIREWALL=true
 MANAGE_WEB_GUI=true
 WEB_GUI_ENABLED=true
 
-# Загружаем сохраненную конфигурацию, если она существует (для корректного audit)
 if [[ -f /etc/proxmox-hardening.conf ]]; then
-  # Load only a root-owned config file; never source a writable/untrusted file.
   if [[ $(stat -c '%u' /etc/proxmox-hardening.conf 2>/dev/null || echo 99999) == 0 && ! -L /etc/proxmox-hardening.conf ]]; then
     # shellcheck disable=SC1091
     source /etc/proxmox-hardening.conf
@@ -101,10 +99,17 @@ if [[ ! -r /etc/os-release ]] || ! grep -qE '^ID=(debian|proxmox)$' /etc/os-rele
   die "This script is designed exclusively for Proxmox VE / Debian Linux."
 fi
 
-# Quick Actions handlers
 if [[ $MODE == "enable-web" ]]; then
   section 'Quick Action: Enabling Proxmox Web GUI (pveproxy)'
   systemctl enable --now pveproxy.service || die "Could not enable/start pveproxy.service."
+  if [[ -f /etc/systemd/system/proxmox-web-port-forward.service ]]; then
+    systemctl enable --now proxmox-web-port-forward.service ||
+      die "pveproxy is active, but alternate-port forwarding failed."
+  fi
+  if [[ -f /etc/systemd/system/proxmox-block-8006.service ]]; then
+    systemctl enable --now proxmox-block-8006.service ||
+      die "Web GUI is active, but the external TCP/8006 block could not be applied."
+  fi
   fixed "Web GUI (pveproxy) successfully enabled and started."
   exit 0
 fi
@@ -154,7 +159,6 @@ write_managed() {
   fi
   backup_file "$dest"
   
-  # Для путей в /etc/pve (pmxcfs FUSE) нельзя делать chown/install с изменением владельца
   if [[ "$dest" == /etc/pve/* ]]; then
     mv -f "$tmp" "$dest"
   else
@@ -240,7 +244,6 @@ if [[ $MODE == apply ]]; then
     MANAGE_WEB_GUI=false
   fi
 
-  # Сохраняем конфигурацию для последующих аудитов и запусков
   cat <<CONF > /etc/proxmox-hardening.conf
 SETUP_ADMIN_USER="$SETUP_ADMIN_USER"
 ADMIN_USER="$ADMIN_USER"
@@ -314,25 +317,37 @@ parse_local_keys() {
 }
 
 if [[ $SETUP_ADMIN_USER == true && $MODE == apply ]]; then
-  if ! id "$ADMIN_USER" &>/dev/null; then
-    useradd -m -s /bin/bash "$ADMIN_USER"
-    usermod -aG sudo "$ADMIN_USER"
-    fixed "Created user '$ADMIN_USER' and added to sudo group."
-    info "Please set password for '$ADMIN_USER':"
-    passwd "$ADMIN_USER" || warn "Password setting was skipped or failed."
+  PVE_USER="${ADMIN_USER}@pve"
+
+  if pveum user list --output-format json |
+    grep -Fq "\"userid\":\"$PVE_USER\"" ||
+   pveum user list --output-format json |
+    grep -Fq "\"userid\": \"$PVE_USER\""; then
+    ok "Proxmox user '$PVE_USER' already exists; skipping creation and password reset."
   else
-    ok "User '$ADMIN_USER' already exists."
+    pveum user add "$PVE_USER" \
+      -comment "Proxmox web administration" ||
+      die "Failed to create Proxmox user '$PVE_USER'."
+
+    info "Set password for Proxmox user '$PVE_USER':"
+    pveum passwd "$PVE_USER" ||
+      die "User was created, but password setup failed. Run: pveum passwd $PVE_USER"
+
+    fixed "Created Proxmox-only user '$PVE_USER'."
   fi
 
-  ADMIN_HOME=$(getent passwd "$ADMIN_USER" | cut -d: -f6)
-  parse_local_keys "$ADMIN_USER" "$ADMIN_HOME" || true
-  parse_local_keys "root" "/root" || true
+  pveum acl modify / -user "$PVE_USER" -role PVEAdmin ||
+    die "Failed to assign PVEAdmin role to '$PVE_USER'."
+
+  fixed "PVEAdmin role ensured for '$PVE_USER' on /."
 else
   if [[ $MODE == audit ]]; then
-    if id "$ADMIN_USER" &>/dev/null; then
-      ok "Admin user '$ADMIN_USER' present"
+    PVE_USER="${ADMIN_USER}@pve"
+    if pveum user list | awk -v u="$PVE_USER" \
+        '$1 == u { found=1 } END { exit !found }'; then
+      ok "Proxmox user '$PVE_USER' exists."
     else
-      warn "Admin user '$ADMIN_USER' missing (will be created on --apply)"
+      warn "Proxmox user '$PVE_USER' missing (will be created on --apply)."
     fi
   fi
 fi
@@ -592,193 +607,262 @@ EOF
   done
 
   PVE_MANAGER_JS="/usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js"
+
+  write_managed /usr/local/sbin/proxmox-no-nag.sh 0755 <<'HOOK_EOF'
+#!/bin/sh
+FILE="/usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js"
+if [ -f "$FILE" ]; then
+    sed -i \
+      -e "s/data\.status\.toLowerCase() !== 'active'/false/g" \
+      -e "s/data\.status\.toLowerCase() != 'active'/false/g" \
+      "$FILE" >/dev/null 2>&1 || true
+fi
+exit 0
+HOOK_EOF
+
+  write_managed /etc/apt/apt.conf.d/99-proxmox-no-nag 0644 <<'APT_EOF'
+DPkg::Post-Invoke {
+  "/usr/local/sbin/proxmox-no-nag.sh";
+};
+APT_EOF
+
   if [[ -f "$PVE_MANAGER_JS" ]]; then
     backup_file "$PVE_MANAGER_JS"
-    sed -Ezi.bak "s/(Ext.Msg.show\(\{\s+title: gettext\('No valid sub)/void\(\{ \/\/\1/g" "$PVE_MANAGER_JS" || true
-    systemctl restart pveproxy.service 2>/dev/null || true
-    fixed "Proxmox subscription nag popup removed."
+    /usr/local/sbin/proxmox-no-nag.sh
+    systemctl restart pveproxy.service 2>/dev/null ||
+      warn "Could not restart pveproxy; restart it manually if the GUI change is not visible."
+    fixed "Proxmox subscription nag patch applied; APT hook configured."
+  else
+    warn "Proxmox toolkit JS not found; APT hook installed, but no GUI patch was applied."
   fi
 
-  DEBIAN_FRONTEND=noninteractive apt-get update -qq || true
+  if ! apt-config dump >/dev/null; then
+    rm -f /etc/apt/apt.conf.d/99-proxmox-no-nag
+    die "APT configuration validation failed; removed the no-nag hook."
+  fi
+
+  DEBIAN_FRONTEND=noninteractive apt-get update -qq ||
+    warn "APT repository update failed; package installation may not succeed."
 fi
 
 if [[ $INSTALL_PACKAGES == true && $MODE == apply ]]; then
   info "Installing essential administration tools..."
-  DEBIAN_FRONTEND=noninteractive apt-get update -qq || true
-  DEBIAN_FRONTEND=noninteractive apt-get install -y \
-    htop \
-    mc \
-    zip \
-    unzip \
-    unrar \
-    atool \
-    curl \
-    nvme-cli \
-    inxi \
-    smartmontools \
-    rclone \
-    ffmpeg \
-    mediainfo 2>/dev/null || warn "Some administration packages failed to install."
-  fixed "Installed administration utilities (htop, mc, unrar, atool, nvme-cli, smartmontools, etc.)."
+  if DEBIAN_FRONTEND=noninteractive apt-get update -qq &&
+     DEBIAN_FRONTEND=noninteractive apt-get install -y \
+       htop mc zip unzip unrar atool curl nvme-cli inxi \
+       smartmontools rclone ffmpeg mediainfo; then
+    fixed "Administration utilities installed successfully."
+  else
+    warn "Some administration packages failed to install; check APT output."
+  fi
 fi
 
 section '6. Fail2ban Proxmox Web GUI & SSH Protection'
 
 if [[ $MODE == apply ]]; then
   info "Installing and configuring Fail2ban..."
-  DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y fail2ban 2>/dev/null || warn "Failed to install fail2ban via apt."
 
-  write_managed /etc/fail2ban/jail.d/proxmox.conf 0644 <<EOF
+  if ! command -v fail2ban-server >/dev/null 2>&1; then
+    if ! DEBIAN_FRONTEND=noninteractive apt-get update -qq ||
+       ! DEBIAN_FRONTEND=noninteractive apt-get install -y fail2ban; then
+      warn "Failed to install fail2ban via apt; skipping its configuration."
+    fi
+  fi
+
+  if command -v fail2ban-server >/dev/null 2>&1; then
+    write_managed /etc/fail2ban/jail.d/proxmox.conf 0644 <<EOF
 # Managed by proxmox.sh v$VERSION
 [sshd]
 enabled = true
-port    = $SSH_PORT
+port = $SSH_PORT
 maxretry = 3
 findtime = 600
-bantime  = 14400
+bantime = 14400
 
 [proxmox]
 enabled = true
-port    = $NEW_PVE_PORT
-filter  = proxmox
+port = $NEW_PVE_PORT
+filter = proxmox
 logpath = /var/log/daemon.log
 maxretry = 3
 findtime = 600
-bantime  = 14400
+bantime = 14400
 EOF
 
-  write_managed /etc/fail2ban/filter.d/proxmox.conf 0644 <<'EOF'
+    write_managed /etc/fail2ban/filter.d/proxmox.conf 0644 <<'FILTER_EOF'
 [Definition]
 failregex = pvedaemon\[.* authentication failure; rhost=<HOST> user=.* msg=.*
 ignoreregex =
-EOF
+FILTER_EOF
 
-  systemctl enable --now fail2ban 2>/dev/null || true
-  fixed "Fail2ban configured for SSH (port $SSH_PORT) and Proxmox Web GUI (port $NEW_PVE_PORT)."
+    if systemctl enable --now fail2ban; then
+      fixed "Fail2ban installed and service started; SSH port $SSH_PORT and GUI port $NEW_PVE_PORT configured."
+    else
+      warn "Fail2ban is installed and configured, but its service failed to start. Check: systemctl status fail2ban"
+    fi
+  fi
 fi
 
-section '7. Firewall rules for management ports'
+section '7. Firewall Rules for Management Ports'
 
 if [[ $SETUP_FIREWALL == true && $MODE == apply ]]; then
-  # Use a dedicated, idempotent iptables chain instead of writing host.fw
-  # rules that differ between the legacy and nftables Proxmox firewall backends.
-  # Default INPUT policy is deliberately not changed to avoid remote lockout.
   apply_managed_filter() {
     local bin="$1"
     command -v "$bin" >/dev/null 2>&1 || return 0
-    "$bin" -N PROXMOX_HARDENING 2>/dev/null || true
-    "$bin" -F PROXMOX_HARDENING
-    "$bin" -A PROXMOX_HARDENING -i lo -j RETURN
-    "$bin" -A PROXMOX_HARDENING -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
-    "$bin" -A PROXMOX_HARDENING -p tcp --dport "$SSH_PORT" -j RETURN
+    "$bin" -w 60 -N PROXMOX_HARDENING 2>/dev/null || true
+    "$bin" -w 60 -F PROXMOX_HARDENING
+    "$bin" -w 60 -A PROXMOX_HARDENING -i lo -j RETURN
+    "$bin" -w 60 -A PROXMOX_HARDENING -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
+    "$bin" -w 60 -A PROXMOX_HARDENING -p tcp --dport "$SSH_PORT" -j RETURN
     if [[ "$WEB_GUI_ENABLED" == true ]]; then
-      "$bin" -A PROXMOX_HARDENING -p tcp --dport "$NEW_PVE_PORT" -j RETURN
+      "$bin" -w 60 -A PROXMOX_HARDENING -p tcp --dport "$NEW_PVE_PORT" -j RETURN
     fi
-    "$bin" -A PROXMOX_HARDENING -p tcp --dport 3128 -j RETURN
-    "$bin" -A PROXMOX_HARDENING -p tcp --dport 5900:5999 -j RETURN
+    "$bin" -w 60 -A PROXMOX_HARDENING -p tcp --dport 3128 -j RETURN
+    "$bin" -w 60 -A PROXMOX_HARDENING -p tcp --dport 5900:5999 -j RETURN
     if [[ "$bin" == ip6tables ]]; then
-      "$bin" -A PROXMOX_HARDENING -p ipv6-icmp -j RETURN 2>/dev/null || true
+      "$bin" -w 60 -A PROXMOX_HARDENING -p ipv6-icmp -j RETURN 2>/dev/null || true
     else
-      "$bin" -A PROXMOX_HARDENING -p icmp -j RETURN 2>/dev/null || true
+      "$bin" -w 60 -A PROXMOX_HARDENING -p icmp -j RETURN 2>/dev/null || true
     fi
-    # Block direct access to the standard PVE GUI port. Local loopback above remains allowed.
-    "$bin" -A PROXMOX_HARDENING -p tcp --dport 8006 -j DROP
-    "$bin" -A PROXMOX_HARDENING -j RETURN
-    "$bin" -C INPUT -j PROXMOX_HARDENING 2>/dev/null || "$bin" -I INPUT 1 -j PROXMOX_HARDENING
+    "$bin" -w 60 -A PROXMOX_HARDENING -p tcp --dport 8006 -j DROP
+    "$bin" -w 60 -A PROXMOX_HARDENING -j RETURN
+    "$bin" -w 60 -C INPUT -j PROXMOX_HARDENING 2>/dev/null || "$bin" -w 60 -I INPUT 1 -j PROXMOX_HARDENING
   }
 
   command -v iptables >/dev/null 2>&1 || die "iptables is required for the managed port filter."
   apply_managed_filter iptables
   apply_managed_filter ip6tables
 
-  # Persist the current rules without replacing them with a hand-written template.
   if command -v netfilter-persistent >/dev/null 2>&1; then
     netfilter-persistent save || die "Failed to persist firewall rules."
     systemctl enable netfilter-persistent.service >/dev/null 2>&1 || true
   else
-    warn "netfilter-persistent is missing; installing iptables-persistent is recommended to preserve rules after reboot."
+    info "netfilter-persistent is not installed; the TCP/8006 block is restored by proxmox-block-8006.service at boot."
   fi
+
   fixed "Managed port filter installed: SSH $SSH_PORT; GUI $NEW_PVE_PORT; direct GUI port 8006 blocked."
 fi
 
-section '8. Web GUI (pveproxy) Management & Port Mapping'
+section '8. Web GUI (pveproxy) Management & Alternative Port'
 
 if [[ $MANAGE_WEB_GUI == true && $MODE == apply ]]; then
   if [[ $WEB_GUI_ENABLED == true ]]; then
-    # pveproxy must remain on its native internal port 8006.
-    # Do NOT set PORT=4443 in /etc/default/pveproxy.
-    if [[ -f /etc/default/pveproxy ]]; then
-      backup_file /etc/default/pveproxy
-      sed -i '/^[[:space:]]*PORT[[:space:]]*=/d' /etc/default/pveproxy
-    fi
+    systemctl enable --now pveproxy.service || die "Could not enable/start pveproxy.service."
 
-    systemctl enable --now pveproxy.service ||
-      die "Could not start pveproxy."
-
-    # Ensure socat is installed.
-    if ! command -v socat >/dev/null 2>&1; then
-      DEBIAN_FRONTEND=noninteractive apt-get install -y socat ||
-        die "Could not install socat."
-    fi
-
-    # Forward the custom external port to pveproxy on loopback:8006.
     if (( NEW_PVE_PORT != 8006 )); then
+      command -v socat >/dev/null 2>&1 || {
+        info "Installing socat for the alternative GUI port..."
+        DEBIAN_FRONTEND=noninteractive apt-get install -y socat || die "Could not install socat."
+      }
+      if ss -ltnH "sport = :$NEW_PVE_PORT" | grep -q .; then
+        if ! systemctl is-active --quiet proxmox-web-port-forward.service; then
+          die "TCP port $NEW_PVE_PORT is already occupied by another process. Choose another GUI port."
+        fi
+      fi
+
+      if [[ -f /etc/default/pveproxy ]] && grep -qE '^PORT=' /etc/default/pveproxy; then
+        backup_file /etc/default/pveproxy
+        sed -i '/^PORT=/d' /etc/default/pveproxy
+        fixed "Removed unsupported PORT override from /etc/default/pveproxy."
+      fi
+      systemctl restart pveproxy.service || die "Could not restart pveproxy.service."
+
       write_managed /etc/systemd/system/proxmox-web-port-forward.service 0644 <<EOF
 [Unit]
-Description=Forward custom Proxmox GUI port to local pveproxy
-After=network.target pveproxy.service
-Wants=pveproxy.service
+Description=Proxmox Web GUI alternative port forward ($NEW_PVE_PORT to 8006)
+After=network-online.target pveproxy.service
+Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/socat TCP-LISTEN:${NEW_PVE_PORT},bind=0.0.0.0,reuseaddr,fork TCP:127.0.0.1:8006
-Restart=always
+ExecStart=/usr/bin/socat TCP-LISTEN:$NEW_PVE_PORT,reuseaddr,fork TCP:127.0.0.1:8006
+Restart=on-failure
 RestartSec=2
 
 [Install]
 WantedBy=multi-user.target
 EOF
-
       systemctl daemon-reload
-      systemctl enable --now proxmox-web-port-forward.service ||
-        die "Could not start the GUI port forwarder."
+      systemctl enable --now proxmox-web-port-forward.service || die "Could not start alternative GUI port service."
+
+      for bin in iptables ip6tables; do
+        command -v "$bin" >/dev/null 2>&1 || continue
+        while "$bin" -t nat -C PREROUTING -p tcp --dport "$NEW_PVE_PORT" -j REDIRECT --to-ports 8006 2>/dev/null; do
+          "$bin" -t nat -D PREROUTING -p tcp --dport "$NEW_PVE_PORT" -j REDIRECT --to-ports 8006
+        done
+        while "$bin" -t nat -C OUTPUT -o lo -p tcp --dport "$NEW_PVE_PORT" -j REDIRECT --to-ports 8006 2>/dev/null; do
+          "$bin" -t nat -D OUTPUT -o lo -p tcp --dport "$NEW_PVE_PORT" -j REDIRECT --to-ports 8006
+        done
+      done
+      if command -v netfilter-persistent >/dev/null 2>&1; then
+        netfilter-persistent save || die "Could not persist cleanup of stale port REDIRECT rules."
+      fi
+
+      write_managed /usr/local/sbin/proxmox-block-8006.sh 0755 <<'BLOCK_EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+for bin in iptables ip6tables; do
+    command -v "$bin" >/dev/null 2>&1 || continue
+    if ! "$bin" -w 60 -C INPUT ! -i lo -p tcp --dport 8006 -j DROP 2>/dev/null; then
+        "$bin" -w 60 -I INPUT 1 ! -i lo -p tcp --dport 8006 -j DROP
     fi
+done
+BLOCK_EOF
 
-    # Block direct access to port 8006 from non-loopback interfaces.
-    # Keep loopback available for socat -> 127.0.0.1:8006.
-    for bin in iptables ip6tables; do
-      command -v "$bin" >/dev/null 2>&1 || continue
+      write_managed /etc/systemd/system/proxmox-block-8006.service 0644 <<'UNIT_EOF'
+[Unit]
+Description=Block external access to Proxmox GUI port 8006
+Wants=network-online.target
+After=network-online.target pve-firewall.service proxmox-firewall.service
+Before=proxmox-web-port-forward.service
 
-      "$bin" -C INPUT ! -i lo -p tcp --dport 8006 -j DROP 2>/dev/null ||
-        "$bin" -I INPUT 1 ! -i lo -p tcp --dport 8006 -j DROP ||
-        die "Could not block external TCP/8006 using $bin."
-    done
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/proxmox-block-8006.sh
+RemainAfterExit=yes
 
-    if command -v netfilter-persistent >/dev/null 2>&1; then
-      netfilter-persistent save ||
-        die "Could not persist firewall rules."
-      systemctl enable netfilter-persistent.service >/dev/null 2>&1 || true
+[Install]
+WantedBy=multi-user.target
+UNIT_EOF
+      systemctl daemon-reload
+      systemctl enable --now proxmox-block-8006.service ||
+        die "Could not enable the persistent external TCP/8006 block."
+      systemctl is-active --quiet proxmox-block-8006.service || die "TCP/8006 block service is not active."
+      fixed "Alternative GUI port $NEW_PVE_PORT is forwarded with socat; external TCP/8006 blocked for IPv4 and IPv6 at boot."
     else
-      warn "netfilter-persistent not found: the port 8006 block may not survive reboot."
+      systemctl disable --now proxmox-web-port-forward.service 2>/dev/null || true
+      systemctl disable --now proxmox-block-8006.service 2>/dev/null || true
+      for bin in iptables ip6tables; do
+        command -v "$bin" >/dev/null 2>&1 || continue
+        while "$bin" -w 60 -C INPUT ! -i lo -p tcp --dport 8006 -j DROP 2>/dev/null; do
+          "$bin" -w 60 -D INPUT ! -i lo -p tcp --dport 8006 -j DROP || break
+        done
+      done
+      fixed "GUI uses the standard pveproxy port 8006; custom-port block service disabled."
     fi
-
-    # Verify that pveproxy and the forwarder are active.
-    systemctl is-active --quiet pveproxy.service ||
-      die "pveproxy is not active."
-    if (( NEW_PVE_PORT != 8006 )); then
-      systemctl is-active --quiet proxmox-web-port-forward.service ||
-        die "GUI port forwarder is not active."
-    fi
-
-    fixed "GUI configured on port $NEW_PVE_PORT; external port 8006 blocked."
   else
     systemctl disable --now proxmox-web-port-forward.service 2>/dev/null || true
-    systemctl disable --now pveproxy.service 2>/dev/null || true
-    fixed "Web GUI disabled."
+    systemctl disable --now pveproxy.service || die "Could not disable pveproxy.service."
+    fixed "Web GUI disabled. Re-enable with: $0 --enable-web"
   fi
 
   if [[ -f /usr/bin/pvebanner ]]; then
-    sed -i "s/:8006/:$NEW_PVE_PORT/g" /usr/bin/pvebanner 2>/dev/null || true
+    backup_file /usr/bin/pvebanner
+    if [[ "$WEB_GUI_ENABLED" == true ]]; then
+      sed -i -E "s/:8006/:$NEW_PVE_PORT/g" /usr/bin/pvebanner 2>/dev/null || true
+    fi
+  fi
+
+  if [[ "$WEB_GUI_ENABLED" == true ]]; then
+    for attempt in {1..10}; do
+      ss -ltnH "sport = :8006" | grep -q . && break
+      sleep 1
+    done
+    ss -ltnH "sport = :8006" | grep -q . || die "pveproxy is not listening on TCP/8006."
+    if (( NEW_PVE_PORT != 8006 )); then
+      ss -ltnH "sport = :$NEW_PVE_PORT" | grep -q . || die "Alternative GUI port $NEW_PVE_PORT is not listening."
+    fi
   fi
 fi
 
@@ -805,4 +889,3 @@ else
   info "To apply hardening, run: sudo $0 --apply"
   info "Quick toggles available : sudo $0 --enable-web | --disable-web"
 fi
-echo
