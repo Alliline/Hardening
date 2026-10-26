@@ -180,6 +180,10 @@ if [[ $MODE == apply ]]; then
     SETUP_ADMIN_USER=true
     read -rp "   Enter new admin username (default: proxadmin): " input_user || true
     ADMIN_USER="${input_user:-proxadmin}"
+    if [[ ! "$ADMIN_USER" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; then
+      warn "Invalid username; falling back to proxadmin."
+      ADMIN_USER="proxadmin"
+    fi
   else
     SETUP_ADMIN_USER=false
   fi
@@ -239,9 +243,11 @@ if [[ $MODE == apply ]]; then
       fi
     else
       WEB_GUI_ENABLED=false
+      NEW_PVE_PORT=8006
     fi
   else
     MANAGE_WEB_GUI=false
+    NEW_PVE_PORT=8006
   fi
 
   cat <<CONF > /etc/proxmox-hardening.conf
@@ -294,7 +300,9 @@ parse_local_keys() {
 
         info "Found public key candidate: $(basename "$pub_file")"
         while IFS= read -r line || [[ -n "$line" ]]; do
-          line=$(echo "$line" | xargs)
+          line=${line%$'\r'}
+          line="${line#"${line%%[![:space:]]*}"}"
+          line="${line%"${line##*[![:space:]]}"}"
           [[ -z "$line" || "$line" =~ ^# ]] && continue
           if [[ "$line" =~ ^(ssh-rsa|ssh-ed25519|ecdsa-sha2-nistp|sk-ssh-ed25519) ]]; then
             if ! grep -qF "$line" "$auth_keys_file"; then
@@ -319,10 +327,7 @@ parse_local_keys() {
 if [[ $SETUP_ADMIN_USER == true && $MODE == apply ]]; then
   PVE_USER="${ADMIN_USER}@pve"
 
-  if pveum user list --output-format json |
-    grep -Fq "\"userid\":\"$PVE_USER\"" ||
-   pveum user list --output-format json |
-    grep -Fq "\"userid\": \"$PVE_USER\""; then
+  if pvesh get "/access/users/$PVE_USER" >/dev/null 2>&1; then
     ok "Proxmox user '$PVE_USER' already exists; skipping creation and password reset."
   else
     pveum user add "$PVE_USER" \
@@ -339,12 +344,24 @@ if [[ $SETUP_ADMIN_USER == true && $MODE == apply ]]; then
   pveum acl modify / -user "$PVE_USER" -role PVEAdmin ||
     die "Failed to assign PVEAdmin role to '$PVE_USER'."
 
-  fixed "PVEAdmin role ensured for '$PVE_USER' on /."
+    fixed "PVEAdmin role ensured for '$PVE_USER' on /."
+
+  if ! command -v sudo >/dev/null 2>&1; then
+    DEBIAN_FRONTEND=noninteractive apt-get update -qq || true
+    DEBIAN_FRONTEND=noninteractive apt-get install -y sudo || die "Could not install sudo."
+  fi
+  if ! id "$ADMIN_USER" >/dev/null 2>&1; then
+    useradd -m -s /bin/bash "$ADMIN_USER" || die "Could not create Linux user '$ADMIN_USER'."
+    info "Set the Linux password for '$ADMIN_USER' (needed for sudo):"
+    passwd "$ADMIN_USER" || die "User created, but password setup failed. Run: passwd $ADMIN_USER"
+    fixed "Created Linux user '$ADMIN_USER'."
+  fi
+  usermod -aG sudo "$ADMIN_USER"
+  parse_local_keys "$ADMIN_USER" "$(getent passwd "$ADMIN_USER" | cut -d: -f6)"
 else
   if [[ $MODE == audit ]]; then
     PVE_USER="${ADMIN_USER}@pve"
-    if pveum user list | awk -v u="$PVE_USER" \
-        '$1 == u { found=1 } END { exit !found }'; then
+    if pvesh get "/access/users/$PVE_USER" >/dev/null 2>&1; then
       ok "Proxmox user '$PVE_USER' exists."
     else
       warn "Proxmox user '$PVE_USER' missing (will be created on --apply)."
@@ -361,6 +378,21 @@ ROOT_LOGIN_POLICY="prohibit-password"
 [[ $SSH_ROOT_KEY_ONLY == false ]] && ROOT_LOGIN_POLICY="no"
 
 if [[ $MODE == apply ]]; then
+  if [[ $ROOT_LOGIN_POLICY != no ]]; then
+    parse_local_keys root /root
+  fi
+  have_key() { [[ -s "$1" ]] && grep -qE '^(ssh-|ecdsa-|sk-)' "$1"; }
+  login_ok=false
+  if [[ $ROOT_LOGIN_POLICY != no ]] && have_key /root/.ssh/authorized_keys; then
+    login_ok=true
+  fi
+  if [[ $SETUP_ADMIN_USER == true ]] && id "$ADMIN_USER" >/dev/null 2>&1; then
+    if have_key "$(getent passwd "$ADMIN_USER" | cut -d: -f6)/.ssh/authorized_keys"; then
+      login_ok=true
+    fi
+  fi
+  [[ $login_ok == true ]] || die "No usable SSH public key found (put *.pub or authorized_keys next to this script). Refusing to disable password login."
+
   write_managed "$SSH_HARDEN_FILE" 0600 <<EOF
 # Managed by proxmox.sh v$VERSION
 Port $SSH_PORT
@@ -379,10 +411,32 @@ ClientAliveCountMax 2
 MaxSessions 10
 Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com
 MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com
-KexAlgorithms curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group16-sha512,diffie-hellman-group18-sha512
+KexAlgorithms mlkem768x25519-sha256,sntrup761x25519-sha512,curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group16-sha512,diffie-hellman-group18-sha512
 EOF
 
+  mkdir -p /run/sshd
+  if ! sshd -t; then
+    if [[ -e "$BACKUP_DIR$SSH_HARDEN_FILE" ]]; then
+      cp -a -- "$BACKUP_DIR$SSH_HARDEN_FILE" "$SSH_HARDEN_FILE"
+    else
+      rm -f "$SSH_HARDEN_FILE"
+    fi
+    die "sshd config test failed; hardening file rolled back, nothing reloaded."
+  fi
+
+  if systemctl is-active --quiet ssh.socket 2>/dev/null; then
+    install -d -m 0755 /etc/systemd/system/ssh.socket.d
+    write_managed /etc/systemd/system/ssh.socket.d/99-port.conf 0644 <<SOCK_EOF
+[Socket]
+ListenStream=
+ListenStream=$SSH_PORT
+SOCK_EOF
+    systemctl daemon-reload
+    systemctl restart ssh.socket
+  fi
   systemctl try-reload-or-restart ssh 2>/dev/null || systemctl try-reload-or-restart sshd 2>/dev/null || true
+  sleep 1
+  ss -ltnH "sport = :$SSH_PORT" | grep -q . || die "sshd is not listening on TCP/$SSH_PORT. Keep your current session open and investigate."
   fixed "OpenSSH hardened on Port $SSH_PORT. Password auth disabled."
   warn "CRITICAL: Open a secondary terminal to test SSH access on port $SSH_PORT before closing your session!"
 else
@@ -403,7 +457,7 @@ net.ipv4.tcp_syncookies = 1
 net.ipv4.tcp_rfc1337 = 1
 net.ipv4.icmp_echo_ignore_broadcasts = 1
 net.ipv4.icmp_ignore_bogus_error_responses = 1
-net.ipv4.tcp_timestamps = 0
+net.ipv4.tcp_timestamps = 1
 net.ipv4.conf.all.rp_filter = 1
 net.ipv4.conf.default.rp_filter = 1
 net.ipv4.conf.all.accept_source_route = 0
@@ -419,7 +473,6 @@ net.ipv4.conf.default.send_redirects = 0
 net.ipv4.conf.all.log_martians = 1
 net.ipv4.conf.default.log_martians = 1
 net.ipv4.tcp_fastopen = 3
-net.ipv4.conf.all.route_localnet = 1
 
 net.core.bpf_jit_harden = 2
 kernel.unprivileged_bpf_disabled = 1
@@ -524,7 +577,6 @@ services_to_mask=(
   avahi-daemon.service avahi-daemon.socket
   cups.service cups.socket cups.path
   pcscd.service ModemManager.service
-  rpcbind.service rpcbind.socket
   bluetooth.service
 )
 
@@ -564,7 +616,7 @@ if [[ $DISABLE_SUBSCRIPTION_NAG == true && $MODE == apply ]]; then
   done
 
   PVE_NO_SUB_SOURCES="/etc/apt/sources.list.d/pve-no-subscription.sources"
-  if [[ ! -f "$PVE_NO_SUB_SOURCES" ]]; then
+  if [[ ! -f "$PVE_NO_SUB_SOURCES" ]] && ! grep -rqsE '^[^#]*pve-no-subscription' /etc/apt/sources.list /etc/apt/sources.list.d/; then
     write_managed "$PVE_NO_SUB_SOURCES" 0644 <<'EOF'
 Types: deb
 URIs: http://download.proxmox.com/debian/pve
@@ -582,9 +634,11 @@ EOF
     else
       sed -i '1i Enabled: false' /etc/apt/sources.list.d/ceph.sources
     fi
-    write_managed /etc/apt/sources.list.d/ceph-no-subscription.sources 0644 <<'EOF'
+    CEPH_RELEASE=$(grep -m1 -oE 'ceph-[a-z]+' /etc/apt/sources.list.d/ceph.sources || true)
+    CEPH_RELEASE=${CEPH_RELEASE:-ceph-tentacle}
+    write_managed /etc/apt/sources.list.d/ceph-no-subscription.sources 0644 <<EOF
 Types: deb
-URIs: http://download.proxmox.com/debian/ceph-tentacle
+URIs: http://download.proxmox.com/debian/$CEPH_RELEASE
 Suites: trixie
 Components: no-subscription
 Signed-By: /usr/share/keyrings/proxmox-archive-keyring.gpg
@@ -596,11 +650,17 @@ EOF
     if [[ -f "$deb_src" ]]; then
       backup_file "$deb_src"
       if [[ "$deb_src" == *.sources ]]; then
-        sed -i 's/Components: \(.*\)/Components: \1 contrib non-free non-free-firmware/' "$deb_src" 2>/dev/null || true
-        sed -i 's/contrib non-free non-free-firmware contrib non-free non-free-firmware/contrib non-free non-free-firmware/g' "$deb_src" 2>/dev/null || true
+        sed -i -E '/^Components:/{
+          /(^|[[:space:]])contrib([[:space:]]|$)/!s/$/ contrib/
+          /(^|[[:space:]])non-free([[:space:]]|$)/!s/$/ non-free/
+          /(^|[[:space:]])non-free-firmware([[:space:]]|$)/!s/$/ non-free-firmware/
+        }' "$deb_src"
       else
-        sed -i 's/\(main\)/\1 contrib non-free non-free-firmware/g' "$deb_src" 2>/dev/null || true
-        sed -i 's/contrib non-free non-free-firmware contrib non-free non-free-firmware/contrib non-free non-free-firmware/g' "$deb_src" 2>/dev/null || true
+        sed -i -E '/^deb[[:space:]].*[[:space:]]main([[:space:]]|$)/{
+          /[[:space:]]contrib([[:space:]]|$)/!s/$/ contrib/
+          /[[:space:]]non-free([[:space:]]|$)/!s/$/ non-free/
+          /[[:space:]]non-free-firmware([[:space:]]|$)/!s/$/ non-free-firmware/
+        }' "$deb_src"
       fi
       fixed "Enabled non-free/contrib repositories in $deb_src"
     fi
@@ -683,7 +743,8 @@ bantime = 14400
 enabled = true
 port = $NEW_PVE_PORT
 filter = proxmox
-logpath = /var/log/daemon.log
+backend = systemd
+journalmatch = _SYSTEMD_UNIT=pvedaemon.service
 maxretry = 3
 findtime = 600
 bantime = 14400
@@ -724,7 +785,9 @@ if [[ $SETUP_FIREWALL == true && $MODE == apply ]]; then
     else
       "$bin" -w 60 -A PROXMOX_HARDENING -p icmp -j RETURN 2>/dev/null || true
     fi
-    "$bin" -w 60 -A PROXMOX_HARDENING -p tcp --dport 8006 -j DROP
+    if (( NEW_PVE_PORT != 8006 )); then
+      "$bin" -w 60 -A PROXMOX_HARDENING -p tcp --dport 8006 -j DROP
+    fi
     "$bin" -w 60 -A PROXMOX_HARDENING -j RETURN
     "$bin" -w 60 -C INPUT -j PROXMOX_HARDENING 2>/dev/null || "$bin" -w 60 -I INPUT 1 -j PROXMOX_HARDENING
   }
