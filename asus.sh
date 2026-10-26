@@ -60,8 +60,11 @@ nvram set conn_diag_enable=0
 nvram set reaper_wanbounce_enable=0
 
 # 5. Disable Web Control Panel
-nvram set http_enable=0
-nvram set https_enable=0
+nvram set http_enable=1
+nvram set misc_http_x=0
+nvram set sshd_wan=0
+nvram set misc_ping_x=0
+nvram set fw_dos_x=1
 
 # Save settings to NVRAM
 nvram commit
@@ -90,6 +93,13 @@ echo 0 > /proc/sys/net/ipv4/conf/all/send_redirects
 echo 0 > /proc/sys/net/ipv4/conf/all/accept_source_route
 echo 1 > /proc/sys/net/ipv4/icmp_echo_ignore_broadcasts
 echo 1 > /proc/sys/net/ipv4/tcp_syncookies
+echo 0 > /proc/sys/net/ipv4/conf/default/accept_redirects
+echo 0 > /proc/sys/net/ipv4/conf/default/send_redirects
+echo 0 > /proc/sys/net/ipv4/conf/default/accept_source_route
+echo 0 > /proc/sys/net/ipv4/conf/all/secure_redirects
+echo 1 > /proc/sys/net/ipv4/icmp_ignore_bogus_error_responses
+[ -e /proc/sys/net/ipv6/conf/default/disable_ipv6 ] && echo 1 > /proc/sys/net/ipv6/conf/default/disable_ipv6
+[ -e /proc/sys/net/ipv6/conf/all/disable_ipv6 ] && echo 1 > /proc/sys/net/ipv6/conf/all/disable_ipv6
 
 # --- Hardening: Aggressive unloading of unused kernel modules ---
 UNWANTED_MODULES="
@@ -143,7 +153,6 @@ done
 # --- 2. Configure physical port eth2 (10G Trunk) ---
 brctl delif br0 eth2 2>/dev/null
 ip link set dev eth2 up
-ip link set dev eth2 promisc on
 
 # --- 3. Create tagged interfaces and bridges ---
 for vlan in 10 20 30 40; do
@@ -229,15 +238,15 @@ insert_before() {
     pos=$(find_rule "$chain" "$target")
 
     if [ -z "$pos" ]; then
-        echo "ERROR: Anchor rule not found in $chain: $target" >&2
-        return 1
+        echo "WARNING: anchor not found in $chain, inserting at top: $target" >&2
+        pos=1
     fi
 
     "$IPT" -I "$chain" "$pos" -j "$jump"
 }
 
 # Create or refresh only our own chains.
-for chain in HOMELAB_INPUT HOMELAB_ISO HOMELAB_WAN; do
+for chain in HOMELAB_INPUT HOMELAB_ISO HOMELAB_WAN HOMELAB_EGRESS; do
     "$IPT" -N "$chain" 2>/dev/null || true
     "$IPT" -F "$chain"
 done
@@ -246,6 +255,7 @@ done
 while "$IPT" -D INPUT -j HOMELAB_INPUT 2>/dev/null; do :; done
 while "$IPT" -D FORWARD -j HOMELAB_ISO 2>/dev/null; do :; done
 while "$IPT" -D FORWARD -j HOMELAB_WAN 2>/dev/null; do :; done
+while "$IPT" -D FORWARD -j HOMELAB_EGRESS 2>/dev/null; do :; done
 
 # ------------------------------------------------------------
 # 1. INPUT: Access to the router itself.
@@ -253,6 +263,16 @@ while "$IPT" -D FORWARD -j HOMELAB_WAN 2>/dev/null; do :; done
 
 # Preserve loopback access.
 "$IPT" -A HOMELAB_INPUT -i lo -j RETURN
+
+# Connection tracking baseline.
+"$IPT" -A HOMELAB_INPUT -m conntrack --ctstate INVALID -j DROP
+"$IPT" -A HOMELAB_INPUT -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+
+# WAN: drop all new inbound ICMP (ping, ICMP tunnels). ICMP errors for
+# existing flows are RELATED and were accepted above.
+for wan in eth0 eth1; do
+    "$IPT" -A HOMELAB_INPUT -i "$wan" -p icmp -j DROP
+done
 
 # Allow DHCP requests from local networks.
 for iface in br0 br10 br20 br30 br40; do
@@ -281,12 +301,34 @@ for port in 22 80 443 4444 4443; do
         -p tcp --dport "$port" -j DROP
 done
 
+# Never accept redirects / probing ICMP types from any interface.
+for t in redirect timestamp-request address-mask-request router-advertisement; do
+    "$IPT" -A HOMELAB_INPUT -p icmp --icmp-type "$t" -j DROP
+done
+
+# Ping to the router: Trusted/SemiTrusted only, small and rate limited.
+for iface in br10 br20; do
+    "$IPT" -A HOMELAB_INPUT -i "$iface" -p icmp --icmp-type echo-request \
+        -m length --length 28:128 \
+        -m limit --limit 5/second --limit-burst 10 -j ACCEPT
+    "$IPT" -A HOMELAB_INPUT -i "$iface" -p icmp --icmp-type echo-request -j DROP
+done
+
+# IoT and Guest: DHCP and DNS only (accepted above), everything else dropped.
+for iface in br30 br40; do
+    "$IPT" -A HOMELAB_INPUT -i "$iface" -j DROP
+done
+
 # Leave unrelated router traffic to the existing firewall.
 "$IPT" -A HOMELAB_INPUT -j RETURN
 
 # ------------------------------------------------------------
 # 2. FORWARD: Inter-VLAN isolation.
 # ------------------------------------------------------------
+
+# Connection tracking baseline.
+"$IPT" -A HOMELAB_ISO -m conntrack --ctstate INVALID -j DROP
+"$IPT" -A HOMELAB_ISO -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
 
 # Prevent new routed connections to IoT and Guest VLANs,
 # including connections created by port forwarding.
@@ -295,11 +337,12 @@ done
 
 # IoT and Guest may not initiate connections outside their VLANs,
 # except connections directed to the WAN.
-"$IPT" -A HOMELAB_ISO -i br30 ! -o eth0 -j DROP
-"$IPT" -A HOMELAB_ISO -i br30 ! -o eth1 -j DROP
-
-"$IPT" -A HOMELAB_ISO -i br40 ! -o eth0 -j DROP
-"$IPT" -A HOMELAB_ISO -i br40 ! -o eth1 -j DROP
+for iface in br30 br40; do
+    for wan in eth0 eth1; do
+        "$IPT" -A HOMELAB_ISO -i "$iface" -o "$wan" -j RETURN
+    done
+    "$IPT" -A HOMELAB_ISO -i "$iface" -j DROP
+done
 
 # Allow Trusted VLAN to reach the main LAN.
 "$IPT" -A HOMELAB_ISO -i br10 -o br0 -j ACCEPT
@@ -340,6 +383,58 @@ done
 "$IPT" -A HOMELAB_WAN -j RETURN
 
 # ------------------------------------------------------------
+# 3b. FORWARD: Egress and tunnelling protection.
+# ------------------------------------------------------------
+WAN_IFACES="eth0 eth1"
+
+# Invalid packets (includes unsolicited echo-replies from reverse ICMP tunnels).
+"$IPT" -A HOMELAB_EGRESS -m conntrack --ctstate INVALID -j DROP
+
+# ptunnel / ptunnel-ng magic value (needs xt_string; skipped if unavailable).
+"$IPT" -A HOMELAB_EGRESS -p icmp -m string --algo bm --hex-string '|d5200880|' -j DROP 2>/dev/null \
+    || echo "NOTE: xt_string unavailable, ptunnel signature rule skipped" >&2
+
+# Inbound: no new ICMP from the Internet to LAN hosts.
+for wan in $WAN_IFACES; do
+    "$IPT" -A HOMELAB_EGRESS -i "$wan" -p icmp -m conntrack --ctstate NEW -j DROP
+done
+
+# IoT/Guest: no outbound ping or probing ICMP at all.
+for iface in br30 br40; do
+    for t in echo-request timestamp-request address-mask-request redirect; do
+        "$IPT" -A HOMELAB_EGRESS -i "$iface" -p icmp --icmp-type "$t" -j DROP
+    done
+done
+
+# Trusted/SemiTrusted/main LAN to Internet: small, rate-limited pings only.
+# Tunnels need large or frequent echo packets; normal ping is <=128 bytes.
+for wan in $WAN_IFACES; do
+    for iface in br0 br10 br20; do
+        "$IPT" -A HOMELAB_EGRESS -i "$iface" -o "$wan" -p icmp --icmp-type echo-request \
+            -m length --length 129:65535 -j DROP
+        "$IPT" -A HOMELAB_EGRESS -i "$iface" -o "$wan" -p icmp --icmp-type echo-request \
+            -m limit --limit 10/second --limit-burst 20 -j RETURN
+        "$IPT" -A HOMELAB_EGRESS -i "$iface" -o "$wan" -p icmp --icmp-type echo-request -j DROP
+    done
+done
+
+# IoT/Guest: no DNS-over-TLS/QUIC and no direct DNS (fallback; see NAT redirect below).
+for iface in br30 br40; do
+    "$IPT" -A HOMELAB_EGRESS -i "$iface" -p tcp --dport 853 -j DROP
+    "$IPT" -A HOMELAB_EGRESS -i "$iface" -p udp --dport 853 -j DROP
+    "$IPT" -A HOMELAB_EGRESS -i "$iface" -p tcp --dport 53 -j DROP
+    "$IPT" -A HOMELAB_EGRESS -i "$iface" -p udp --dport 53 -j DROP
+done
+
+# IoT/Guest: force hardcoded DNS (8.8.8.8 etc.) to the router's dnsmasq.
+for iface in br30 br40; do
+    for proto in udp tcp; do
+        "$IPT" -t nat -C PREROUTING -i "$iface" -p "$proto" --dport 53 -j REDIRECT --to-ports 53 2>/dev/null \
+            || "$IPT" -t nat -I PREROUTING -i "$iface" -p "$proto" --dport 53 -j REDIRECT --to-ports 53
+    done
+done
+
+# ------------------------------------------------------------
 # 4. Install hooks without resetting system firewall rules.
 # ------------------------------------------------------------
 
@@ -358,6 +453,9 @@ insert_before FORWARD \
     "-A FORWARD -j SDN_FF" \
     HOMELAB_WAN || exit 1
 
+# Egress/tunnel filter first: it only DROPs or RETURNs, never ACCEPTs.
+"$IPT" -I FORWARD 1 -j HOMELAB_EGRESS
+
 echo "Homelab VLAN firewall rules installed."
 
 EOF
@@ -370,6 +468,7 @@ echo "[+] Applying scripts and restarting services..."
 /jffs/scripts/services-start
 /jffs/scripts/firewall-start
 service restart_dnsmasq
+service restart_httpd
 
 echo "=================================================="
 echo " Ultra-Hardened Setup Completed Successfully!"
