@@ -620,7 +620,7 @@ FIREFOX_PREFS_EOF
     "Cookies": {
       "Default": false,
       "AcceptThirdParty": "never",
-      "Locked": true
+      "Locked": false
     },
     "Preferences": {
       "browser.privatebrowsing.autostart": {
@@ -689,10 +689,6 @@ FIREFOX_PREFS_EOF
       }
     },
     "ExtensionSettings": {
-      "*": {
-        "installation_mode": "blocked",
-        "blocked_install_message": "Only uBlock Origin is allowed by system policy."
-      },
       "uBlock0@raymondhill.net": {
         "installation_mode": "force_installed",
         "install_url": "https://addons.mozilla.org/firefox/downloads/latest/ublock-origin/latest.xpi"
@@ -1730,6 +1726,7 @@ dnf_apps=(
   easyeffects
   gnome-tweaks
   gnome-extensions-app
+  fwknop
 )
 declare -A flatpak_apps=(
   [flatseal]="com.github.tchx84.Flatseal"
