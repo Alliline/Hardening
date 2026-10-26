@@ -49,7 +49,7 @@ chmod +x ./proxmox.sh
 - Парсит лежащий рядом id_rsa.pub, добавляет в ssh (nopass). 
 - Протестировано: 26.10.2026 на Proxmox 9.2 (7.0.2-6-pve).
 
-## Web / Lab (LAMP): Fedora Server 44/45
+## Web / Lab (LEMP): Fedora Server 44/45
 ```
 chmod +x ./server.sh
 ./server.sh 
