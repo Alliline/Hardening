@@ -270,13 +270,13 @@ for iface in br0 br10 br20 br30 br40; do
 done
 
 # Allow management access only from Trusted VLAN.
-for port in 22 80 443 4444; do
+for port in 22 80 443 4444 4443; do
     "$IPT" -A HOMELAB_INPUT -i br10 \
         -p tcp --dport "$port" -j ACCEPT
 done
 
 # Block router management ports from every other interface.
-for port in 22 80 443 4444; do
+for port in 22 80 443 4444 4443; do
     "$IPT" -A HOMELAB_INPUT \
         -p tcp --dport "$port" -j DROP
 done
@@ -305,7 +305,7 @@ done
 "$IPT" -A HOMELAB_ISO -i br10 -o br0 -j ACCEPT
 
 # Allow Trusted VLAN to access selected SemiTrusted VLAN services.
-for port in 22 4444 11434; do
+for port in 22 4444 4443 11434; do
     "$IPT" -A HOMELAB_ISO -i br10 -o br20 \
         -p tcp --dport "$port" -j ACCEPT
 done
