@@ -468,7 +468,6 @@ echo "[+] Applying scripts and restarting services..."
 /jffs/scripts/services-start
 /jffs/scripts/firewall-start
 service restart_dnsmasq
-service restart_httpd
 
 echo "=================================================="
 echo " Ultra-Hardened Setup Completed Successfully!"
