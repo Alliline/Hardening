@@ -1,14 +1,9 @@
 #!/usr/bin/env bash
-# =============================================================================
-# server.sh
-# Ultimate Security Hardening + LEMP + Redis + Advanced WAF for Fedora Server 44/45+
-# Version: 0.2 (Final Production Edition with Dynamic RAM & SSH IP Whitelisting)
-# =============================================================================
 set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-VERSION='0.2'
+VERSION='0.3'
 MODE='audit'
 FORCE_SSH_KEEP=true
 
@@ -21,6 +16,8 @@ SETUP_FIREWALL_HTTP=true
 SSH_PORT=4444
 SSH_ALLOW_IPS=""
 AGGRESSIVE_USERNS=false
+NABLE_CROWDSEC=true
+ENABLE_FWKNOP=false
 
 # ---------------------------------------------------------------------------
 # Command-line argument parsing
@@ -38,7 +35,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --apply)          MODE='apply'; shift ;;
     --audit)          MODE='audit'; shift ;;
-    --ssh-allow)      MODE='ssh-allow'; SSH_ALLOW_IPS="$2"; shift 2 ;;
+    --ssh-allow)      MODE='ssh-allow'; SSH_ALLOW_IPS="${2:?--ssh-allow needs an IP list}"; shift 2 ;;
     --vhost-add)      MODE='vhost'; VHOST_ACTION='add'; shift ;;
     --vhost-del)      MODE='vhost'; VHOST_ACTION='del'; shift ;;
     --vhost-list)     MODE='vhost'; VHOST_ACTION='list'; shift ;;
@@ -171,7 +168,11 @@ write_managed() {
   local tmp
   install -d -m 0755 "$(dirname "$dest")"
   tmp=$(mktemp "$(dirname "$dest")/.secure-hardening.XXXXXX")
-  cat > "$tmp"
+  if (( $# >= 3 )); then
+    printf '%s\n' "$3" > "$tmp"
+  else
+    cat > "$tmp"
+  fi
   chmod "$mode" "$tmp"
   if [[ -f $dest ]] && cmp -s "$tmp" "$dest"; then
     rm -f "$tmp"
@@ -274,7 +275,9 @@ info "Detected System RAM: ${TOTAL_RAM_MB}MB -> Adaptive profile applied (InnoDB
 # 1. /ETC/NGINX/DENY.CONF HANDLING
 # ===========================================================================
 section '1. Initializing /etc/nginx/deny.conf'
-if [[ ! -f "$NGINX_DENY_CONF" ]]; then
+if [[ $MODE == audit ]]; then
+  [[ -f "$NGINX_DENY_CONF" ]] && ok "$NGINX_DENY_CONF exists" || warn "$NGINX_DENY_CONF missing (created with --apply)"
+elif [[ ! -f "$NGINX_DENY_CONF" ]]; then
   install -d -m 0755 /etc/nginx
   touch "$NGINX_DENY_CONF"
   chmod 0644 "$NGINX_DENY_CONF"
@@ -309,8 +312,8 @@ server {
 
     server_name $domain www.$domain;
 
-    ssl_certificate     /etc/letsencrypt/live/$domain/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/$domain/privkey.pem;
+    ssl_certificate     ${SSL_CERT:-/etc/letsencrypt/live/$domain/fullchain.pem};
+    ssl_certificate_key ${SSL_KEY:-/etc/letsencrypt/live/$domain/privkey.pem};
 
     ssl_protocols TLSv1.2 TLSv1.3;
     ssl_prefer_server_ciphers off;
@@ -318,8 +321,6 @@ server {
     ssl_session_timeout 1d;
     ssl_session_cache shared:SSL:10m;
     ssl_session_tickets off;
-    resolver 1.1.1.1 8.8.8.8 valid=300s;
-    resolver_timeout 5s;
 
     root $site_root/public;
     index index.php;
@@ -329,7 +330,9 @@ server {
     access_log /var/log/nginx/probe.log combined if=\$is_bad_ua;
     access_log /var/log/nginx/probe.log combined if=\$is_bad_probe;
 
-    # Security headers
+    limit_req zone=req_per_ip burst=20 nodelay;
+    limit_conn conn_per_ip 20;
+
     add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
     add_header X-Frame-Options "SAMEORIGIN" always;
     add_header X-Content-Type-Options "nosniff" always;
@@ -346,13 +349,6 @@ server {
     if (\$is_bad_ua)     { return 444; }
     if (\$is_bad_probe)  { return 444; }
     if (\$is_bad_method) { return 444; }
-
-    if (\$http_user_agent = "")             { return 444; }
-    if (\$http_user_agent ~ "^.{0,10}$")    { return 444; }
-    if (\$http_user_agent ~ "^.{400,}$")    { return 444; }
-
-    if (\$request_uri ~ "/{3,}")            { return 444; }
-    if (\$request_uri ~ "^.{1000,}")        { return 444; }
 
     # Hide all dotfiles / sensitive files globally
     location ~ /\\. {
@@ -409,10 +405,11 @@ server {
         return 404;
     }
 
-    client_max_body_size 32M;
-    client_body_timeout 30s;
-    client_header_timeout 30s;
-    send_timeout 30s;
+    client_max_body_size 16M;
+    client_body_timeout 10s;
+    client_header_timeout 10s;
+    send_timeout 10s;
+    limit_rate 2m;
     server_tokens off;
 }
 EOF
@@ -431,13 +428,14 @@ server {
 
 server {
     listen 443 ssl;
+    listen 443 quic;
     http2 on;
     http3 on;
 
     server_name $domain www.$domain;
 
-    ssl_certificate     /etc/letsencrypt/live/$domain/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/$domain/privkey.pem;
+    ssl_certificate     ${SSL_CERT:-/etc/letsencrypt/live/$domain/fullchain.pem};
+    ssl_certificate_key ${SSL_KEY:-/etc/letsencrypt/live/$domain/privkey.pem};
 
     ssl_protocols TLSv1.2 TLSv1.3;
     ssl_prefer_server_ciphers off;
@@ -453,6 +451,9 @@ server {
     access_log /var/log/nginx/probe.log combined if=\$is_bad_ua;
     access_log /var/log/nginx/probe.log combined if=\$is_bad_probe;
 
+    limit_req zone=req_per_ip burst=20 nodelay;
+    limit_conn conn_per_ip 20;
+
     add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
     add_header X-Frame-Options "SAMEORIGIN" always;
     add_header X-Content-Type-Options "nosniff" always;
@@ -463,13 +464,6 @@ server {
     if (\$is_bad_ua)     { return 444; }
     if (\$is_bad_probe)  { return 444; }
     if (\$is_bad_method) { return 444; }
-
-    if (\$http_user_agent = "")             { return 444; }
-    if (\$http_user_agent ~ "^.{0,10}$")    { return 444; }
-    if (\$http_user_agent ~ "^.{400,}$")    { return 444; }
-
-    if (\$request_uri ~ "/{3,}")            { return 444; }
-    if (\$request_uri ~ "^.{1000,}")        { return 444; }
 
     location / {
         try_files \$uri \$uri/ =404;
@@ -489,7 +483,11 @@ server {
         return 404;
     }
 
-    client_max_body_size 32M;
+    client_max_body_size 16M;
+    client_body_timeout 10s;
+    client_header_timeout 10s;
+    send_timeout 10s;
+    limit_rate 2m;
     server_tokens off;
 }
 EOF
@@ -508,21 +506,14 @@ server {
     access_log /var/log/nginx/probe.log combined if=\$is_bad_ua;
     access_log /var/log/nginx/probe.log combined if=\$is_bad_probe;
 
-    ssl_certificate     /etc/letsencrypt/live/$domain/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/$domain/privkey.pem;
+    ssl_certificate     ${SSL_CERT:-/etc/letsencrypt/live/$domain/fullchain.pem};
+    ssl_certificate_key ${SSL_KEY:-/etc/letsencrypt/live/$domain/privkey.pem};
 
     if (\$is_bad_ip)    { return 444; }
     if (\$is_bad_subnet) { return 444; }
     if (\$is_bad_ua)     { return 444; }
     if (\$is_bad_probe)  { return 444; }
     if (\$is_bad_method) { return 444; }
-
-    if (\$http_user_agent = "")             { return 444; }
-    if (\$http_user_agent ~ "^.{0,10}$")    { return 444; }
-    if (\$http_user_agent ~ "^.{400,}$")    { return 444; }
-
-    if (\$request_uri ~ "/{3,}")            { return 444; }
-    if (\$request_uri ~ "^.{1000,}")        { return 444; }
 
     return 301 $target_url\$request_uri;
 }
@@ -559,8 +550,8 @@ php_admin_flag[allow_url_include]  = off
 php_admin_value[session.save_path] = ${site_root}/sessions
 php_admin_value[upload_tmp_dir]    = ${site_root}/tmp
 php_admin_value[memory_limit]      = ${PHP_MEMORY_LIMIT}
-php_admin_value[max_execution_time]= 60
-php_admin_value[max_input_time]    = 60
+php_admin_value[max_execution_time]= 30
+php_admin_value[max_input_time]    = 30
 php_admin_flag[expose_php]         = off
 php_admin_value[error_log]         = ${site_root}/logs/php-error.log
 php_admin_flag[log_errors]         = on
@@ -572,7 +563,7 @@ php_admin_flag[session.upload_progress.enabled] = off
 security.limit_extensions          = .php
 clear_env = yes
 catch_workers_output = yes
-request_terminate_timeout = 60s
+request_terminate_timeout = 30s
 request_slowlog_timeout = 5s
 slowlog = ${site_root}/logs/php-slow.log
 EOF
@@ -603,6 +594,7 @@ create_database() {
   if [[ -z "$db_pass" ]]; then
     db_pass=$(openssl rand -base64 24 | tr -d '=+/' | cut -c1-24)
   fi
+  [[ "$db_pass" =~ ^[A-Za-z0-9_.@%^*-]+$ ]] || die "Password may only contain A-Z a-z 0-9 _ . @ % ^ * -"
 
   if mysql -Nse "SELECT SCHEMA_NAME FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME='$db_name';" 2>/dev/null | grep -q .; then
     die "Database '$db_name' already exists."
@@ -699,8 +691,9 @@ if [[ $MODE == vhost ]]; then
       ;;
     add)
       [[ -z "$VHOST_DOMAIN" ]] && die "Specify domain: --vhost-add domain.tld [--type php|static|redirect]"
-      DOMAIN="$VHOST_DOMAIN"
-      SITE_USER="web_$(echo "$DOMAIN" | tr '.-' '_')"
+      DOMAIN="${VHOST_DOMAIN,,}"
+      [[ "$DOMAIN" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$ ]] || die "Invalid domain name: $VHOST_DOMAIN"
+      SITE_USER="web_$(echo "$DOMAIN" | tr '.-' '_' | cut -c1-28)"
       SITE_ROOT="$VHOSTS_BASE/$DOMAIN"
       POOL_NAME=$(echo "$DOMAIN" | tr '.-' '_')
       SOCK="$PHP_SOCK_DIR/${POOL_NAME}.sock"
@@ -711,14 +704,19 @@ if [[ $MODE == vhost ]]; then
 
       info "Creating isolated system user: $SITE_USER"
       if ! id "$SITE_USER" &>/dev/null; then
-        useradd -r -d "$SITE_ROOT" -s /sbin/nologin -g nginx "$SITE_USER" || die "Failed to create user."
+        useradd -r -U -G nginx -d "$SITE_ROOT" -s /sbin/nologin "$SITE_USER" || die "Failed to create user."
       fi
 
+      install -d -m 0755 -o root -g root "$VHOSTS_BASE"
       install -d -o "$SITE_USER" -g nginx -m 0750 "$SITE_ROOT"
       install -d -o "$SITE_USER" -g nginx -m 0750 "$SITE_ROOT/public"
       install -d -o "$SITE_USER" -g nginx -m 0750 "$SITE_ROOT/logs"
 
+      SSL_CERT="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
+      SSL_KEY="/etc/letsencrypt/live/$DOMAIN/privkey.pem"
       if [[ ! -d "/etc/letsencrypt/live/$DOMAIN" ]]; then
+        SSL_CERT="/etc/nginx/ssl-self/$DOMAIN.crt"
+        SSL_KEY="/etc/nginx/ssl-self/$DOMAIN.key"
         info "Generating temporary self-signed certificate for $DOMAIN..."
         install -d -m 0700 /etc/nginx/ssl-self
         openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
@@ -766,13 +764,17 @@ if [[ $MODE == vhost ]]; then
           ;;
       esac
 
+      if command -v semanage &>/dev/null; then
+        semanage fcontext -a -t httpd_sys_rw_content_t "$VHOSTS_BASE(/.*)?" 2>/dev/null || true
+      fi
       if command -v restorecon &>/dev/null; then
-        restorecon -Rv "$SITE_ROOT" 2>/dev/null || true
+        restorecon -R "$VHOSTS_BASE" 2>/dev/null || true
       fi
 
       systemctl reload php-fpm 2>/dev/null || true
       if nginx -t; then
         systemctl reload nginx
+        systemctl restart fail2ban 2>/dev/null || true   # pick up the new log glob
         fixed "Virtual host $DOMAIN created successfully."
       else
         fail "nginx configuration test failed – please inspect."
@@ -835,13 +837,9 @@ if [[ $MODE == 'ssh-allow' ]]; then
   info "Configuring firewalld to restrict SSH (port $SSH_PORT) to: ${validated_ips[*]}"
   
   firewall-cmd --permanent --zone=public --remove-service=ssh 2>/dev/null || true
-  
-  while firewall-cmd --permanent --zone=public --query-rich-rule="rule family=ipv4 port port=\"$SSH_PORT\" protocol=tcp accept" 2>/dev/null; do
-    firewall-cmd --permanent --zone=public --remove-rich-rule="rule family=ipv4 port port=\"$SSH_PORT\" protocol=tcp accept" 2>/dev/null || true
-  done
 
   existing_rich_rules=$(firewall-cmd --permanent --zone=public --list-rich-rules 2>/dev/null || true)
-  while IFS=read -r rule; do
+  while IFS= read -r rule; do
     if [[ "$rule" =~ port\ port=\"$SSH_PORT\" ]]; then
       firewall-cmd --permanent --zone=public --remove-rich-rule="$rule" 2>/dev/null || true
     fi
@@ -864,14 +862,17 @@ fi
 # ===========================================================================
 if [[ $MODE == apply ]]; then
   section 'Interactive installation options'
-  if ask_yn "1. Install and configure LEMP stack + Redis (nginx + PHP-FPM + MariaDB + Redis)?" "y"; then INSTALL_LEMP=true; else INSTALL_LEMP=false; fi
-  if ask_yn "2. Perform secure tuning of MariaDB & Redis (RAM & performance)?" "y"; then SECURE_MARIADB=true; else SECURE_MARIADB=false; fi
-  if ask_yn "3. Apply aggressive nginx + PHP hardening & WAF filters?" "y"; then HARDEN_NGINX_PHP=true; else HARDEN_NGINX_PHP=false; fi
-  if ask_yn "4. Install and configure fail2ban jails?" "y"; then ENABLE_FAIL2BAN=true; else ENABLE_FAIL2BAN=false; fi
-  if ask_yn "5. Open HTTP/HTTPS ports in firewalld?" "y"; then SETUP_FIREWALL_HTTP=true; else SETUP_FIREWALL_HTTP=false; fi
+  ask_yn "1. Install LEMP stack + Redis?" "y" && INSTALL_LEMP=true || INSTALL_LEMP=false
+  ask_yn "2. Secure MariaDB & Redis?" "y" && SECURE_MARIADB=true || SECURE_MARIADB=false
+  ask_yn "3. Apply aggressive Nginx + PHP WAF filters?" "y" && HARDEN_NGINX_PHP=true || HARDEN_NGINX_PHP=false
+  ask_yn "4. Install and configure Fail2ban (IPv4 only)?" "y" && ENABLE_FAIL2BAN=true || ENABLE_FAIL2BAN=false
+  ask_yn "5. Open HTTP/HTTPS ports in firewalld?" "y" && SETUP_FIREWALL_HTTP=true || SETUP_FIREWALL_HTTP=false
+  ask_yn "6. Install and configure CrowdSec (Community WAF/Bouncer)?" "y" && ENABLE_CROWDSEC=true || ENABLE_CROWDSEC=false
+  ask_yn "7. Setup FWKNOP (Port Knocking / Single Packet Auth)?" "n" && ENABLE_FWKNOP=true || ENABLE_FWKNOP=false
 
-  read -rp "6. New SSH port (default 4444): " custom_ssh_port || true
+  read -rp "New SSH port (default 4444): " custom_ssh_port || true
   SSH_PORT="${custom_ssh_port:-4444}"
+
   if ! [[ "$SSH_PORT" =~ ^[0-9]+$ ]] || (( SSH_PORT < 1024 || SSH_PORT > 65535 )); then
     warn "Invalid port – falling back to 4444."
     SSH_PORT=4444
@@ -889,12 +890,8 @@ section '1. Kernel and bootloader security parameters'
 KARGS_CORE=(
   slab_nomerge
   init_on_alloc=1
-  init_on_free=1
   page_alloc.shuffle=1
   randomize_kstack_offset=on
-  iommu=force
-  iommu.strict=1
-  iommu.passthrough=0
   pti=on
   vsyscall=none
   random.trust_cpu=off
@@ -906,6 +903,7 @@ KARGS_CORE=(
   spectre_v2_user=on
   spec_rstack_overflow=safe-ret
   l1tf=full,force
+  ipv6.disable=1
 )
 
 KARGS_EXTRA=(
@@ -981,8 +979,8 @@ services_to_mask=(
   cups.service cups.socket cups.path pcscd.service ModemManager.service geoclue.service
   rpcbind.service nfs-client.target nfs-server.service rpc-statd.service rpc-gssd.service rpc-svcgssd.service
   gssproxy.service mcelog.service kdump.service plymouth-start.service plymouth-quit.service plymouth-quit-wait.service
-  systemd-coredump.socket systemd-coredump@.service debug-shell.service emergency.service rescue.service
-  iscsid.service iscsi.service lvm2-monitor.service dm-event.service mdmonitor.service raid-check.timer
+  systemd-coredump.socket systemd-coredump@.service debug-shell.service
+  iscsid.service iscsi.service mdmonitor.service raid-check.timer
   hypervkvpd.service hypervvssd.service hypervfcopyd.service bluetooth.service postfix.service sendmail.service exim.service dovecot.service
 )
 
@@ -1003,11 +1001,11 @@ done
 
 if [[ $MODE == apply ]]; then
   info "Installing useful server utilities and packages..."
-  dnf install -y \
-    curl wget htop mc sysbench mediainfo ffmpeg ImageMagick detox atool \
-    zip p7zip p7zip-plugins inxi atop nvme-cli smartmontools \
-    certbot python3-certbot-nginx redis \
-    2>/dev/null || warn "Some packages could not be installed (non-fatal)."
+  dnf install -y --skip-unavailable \
+    curl wget htop mc sysbench mediainfo ffmpeg-free ImageMagick detox atool \
+    zip 7zip inxi atop nvme-cli smartmontools nftables \
+    certbot python3-certbot-nginx policycoreutils-python-utils valkey valkey-compat-redis \
+    || warn "Some packages could not be installed (non-fatal)."
   fixed "Base packages installed"
 fi
 
@@ -1023,7 +1021,7 @@ elif [[ $MODE == apply ]]; then
   write_managed "$TIMEOUT_CONF" 0644 <<'EOF'
 [Manager]
 DefaultTimeoutStopSec=5s
-DefaultTimeoutStartSec=15s
+DefaultTimeoutStartSec=10s
 EOF
   systemctl daemon-reload
 else
@@ -1039,11 +1037,25 @@ SSH_DIR="/etc/ssh/sshd_config.d"
 SSH_HARDEN_FILE="$SSH_DIR/99-server-hardening.conf"
 
 if [[ $MODE == apply ]]; then
+  info "SSH public-key setup..."
+  read -rp "Paste your public SSH key (leave empty to configure later): " user_ssh_key || true
+  read -rp "Create a new sudo user (e.g. admin) [leave empty to skip]: " new_sudo_user || true
+  user_ssh_key="${user_ssh_key:-}"
+  new_sudo_user="${new_sudo_user:-}"
+
+  SSH_ROOT_LOGIN="no"
+  SSH_PASS_AUTH="no"
+  if [[ -z "$user_ssh_key" || -z "$new_sudo_user" ]]; then
+    SSH_ROOT_LOGIN="prohibit-password"
+    SSH_PASS_AUTH="yes"
+    warn "No key + sudo user supplied: keeping password auth ON to avoid lock-out."
+  fi
+
   write_managed "$SSH_HARDEN_FILE" 0600 <<EOF
 # Managed by server.sh
 Port $SSH_PORT
-PermitRootLogin no
-PasswordAuthentication no
+PermitRootLogin $SSH_ROOT_LOGIN
+PasswordAuthentication $SSH_PASS_AUTH
 PubkeyAuthentication yes
 KbdInteractiveAuthentication no
 X11Forwarding no
@@ -1055,15 +1067,11 @@ LoginGraceTime 20
 ClientAliveInterval 300
 ClientAliveCountMax 2
 MaxSessions 5
-Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com,aes256-ctr,aes192-ctr,aes128-ctr
+Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com
 MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com,hmac-sha2-512,hmac-sha2-256
 KexAlgorithms curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group16-sha512,diffie-hellman-group18-sha512
 EOF
 
-  info "SSH public-key setup..."
-  read -rp "Paste your public SSH key (leave empty to configure later): " user_ssh_key || true
-
-  read -rp "Create a new sudo user (e.g. admin) [leave empty to skip]: " new_sudo_user || true
   if [[ -n "$new_sudo_user" ]]; then
     if ! id "$new_sudo_user" &>/dev/null; then
       useradd -m -s /bin/bash "$new_sudo_user"
@@ -1073,7 +1081,7 @@ EOF
     fi
 
     if [[ -n "$user_ssh_key" ]]; then
-      user_home=$(eval echo "~$new_sudo_user")
+      user_home=$(getent passwd "$new_sudo_user" | cut -d: -f6)
       install -d -o "$new_sudo_user" -g "$new_sudo_user" -m 0700 "$user_home/.ssh"
       auth_keys="$user_home/.ssh/authorized_keys"
       touch "$auth_keys"
@@ -1087,7 +1095,13 @@ EOF
     fi
   fi
 
-  systemctl reload sshd 2>/dev/null || systemctl restart sshd
+  if [[ $SSH_PORT != 22 ]]; then
+    dnf install -y policycoreutils-python-utils >/dev/null 2>&1 || true
+    semanage port -a -t ssh_port_t -p tcp "$SSH_PORT" 2>/dev/null || \
+      semanage port -m -t ssh_port_t -p tcp "$SSH_PORT" || warn "Could not label SSH port for SELinux"
+  fi
+  sshd -t || die "sshd config invalid – aborting before restart."
+  systemctl restart sshd
   fixed "SSH moved to port $SSH_PORT. Root login disabled. Password auth disabled."
   warn "CRITICAL: Open a second terminal and verify SSH connectivity on port $SSH_PORT BEFORE closing this session!"
 fi
@@ -1117,13 +1131,13 @@ if command -v firewall-cmd &>/dev/null; then
     if [[ -n "$SSH_ALLOW_IPS" ]]; then
       IFS=',' read -ra IP_Array <<< "$SSH_ALLOW_IPS"
       for ip in "${IP_Array[@]}"; do
-        ip="$(echo -e "$ip" | tr -d '[:space:]')"
+        ip="$(echo "$ip" | tr -d '[:space:]')"
         [[ -z "$ip" ]] && continue
         if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$ ]] || [[ "$ip" =~ ^([0-9a-fA-F]{0,4}:){1,7}[0-9a-fA-F]{0,4}(/[0-9]{1,3})?$ ]]; then
           fam="ipv4"
           [[ "$ip" =~ : ]] && fam="ipv6"
           firewall-cmd --permanent --zone=public \
-            --add-rich-rule="rule family=\"$fam\" source address=\"$ip\" port port=\"${SSH_PORT}\" protocol=tcp accept" 2>/dev/null || true
+            --add-rich-rule="rule family=\"$fam\" source address=\"$ip\" port port=\"${SSH_PORT}\" protocol=tcp limit value=\"10/m\" accept"
         else
           warn "Skipping invalid IP format during apply: $ip"
         fi
@@ -1131,7 +1145,7 @@ if command -v firewall-cmd &>/dev/null; then
       fixed "SSH firewall rules configured with specific IP whitelist."
     else
       firewall-cmd --permanent --zone=public \
-        --add-rich-rule="rule family=ipv4 port port=\"${SSH_PORT}\" protocol=tcp accept" 2>/dev/null || true
+        --add-rich-rule="rule family=ipv4 port port=\"${SSH_PORT}\" protocol=tcp limit value=\"10/m\" accept" 2>/dev/null || true
     fi
 
     for p in 3306 6379 5432 11211 27017; do
@@ -1142,6 +1156,7 @@ if command -v firewall-cmd &>/dev/null; then
     if [[ $SETUP_FIREWALL_HTTP == true ]]; then
       firewall-cmd --permanent --zone=public --add-service=http 2>/dev/null || true
       firewall-cmd --permanent --zone=public --add-service=https 2>/dev/null || true
+      firewall-cmd --permanent --zone=public --add-port=443/udp 2>/dev/null || true
     fi
 
     for zone in public; do
@@ -1170,7 +1185,7 @@ net.ipv4.tcp_syncookies = 1
 net.ipv4.tcp_rfc1337 = 1
 net.ipv4.icmp_echo_ignore_broadcasts = 1
 net.ipv4.icmp_ignore_bogus_error_responses = 1
-net.ipv4.tcp_timestamps = 0
+net.ipv4.tcp_timestamps = 1
 net.ipv4.conf.all.rp_filter = 1
 net.ipv4.conf.default.rp_filter = 1
 net.ipv4.conf.all.accept_source_route = 0
@@ -1183,13 +1198,16 @@ net.ipv4.conf.all.send_redirects = 0
 net.ipv4.conf.default.send_redirects = 0
 net.ipv4.conf.all.log_martians = 1
 net.ipv4.conf.default.log_martians = 1
-net.ipv6.conf.all.use_tempaddr = 2
-net.ipv6.conf.default.use_tempaddr = 2
 net.ipv4.tcp_fastopen = 3
 net.ipv4.conf.all.arp_ignore = 2
 net.ipv4.conf.default.arp_ignore = 2
 net.ipv4.conf.all.arp_announce = 2
 net.ipv4.conf.default.arp_announce = 2
+
+# === Complete IPv6 Disablement ===
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+net.ipv6.conf.lo.disable_ipv6 = 1
 
 # === Kernel self-protection ===
 net.core.bpf_jit_harden = 2
@@ -1218,21 +1236,22 @@ fs.protected_regular = 2
 fs.protected_fifos = 2
 fs.protected_hardlinks = 1
 fs.protected_symlinks = 1
-fs.protected_symlinks_create = 1
-fs.protected_hardlinks_create = 1
 
 # === Server high-load limits & buffers ===
-kernel.pid_max = 65536
+kernel.pid_max = 4194304
 vm.mmap_min_addr = 65536
 net.core.somaxconn = 65535
 net.ipv4.tcp_max_syn_backlog = 65535
 net.core.netdev_max_backlog = 16384
 net.ipv4.tcp_fin_timeout = 15
 net.ipv4.tcp_tw_reuse = 1
+net.netfilter.nf_conntrack_tcp_loose = 0
+vm.overcommit_memory = 1
 SYSCTL_EOF
 )
 
 if [[ $MODE == apply ]]; then
+  modprobe nf_conntrack 2>/dev/null || true
   write_managed "$SYSCTL_FILE" 0644 <<<"$SYSCTL_CONTENT"
   sysctl --system >/dev/null 2>&1 || true
   fixed "sysctl parameters applied cleanly"
@@ -1245,7 +1264,7 @@ section '7. LEMP stack, Redis & Dynamic RAM Tuning'
 
 if [[ $INSTALL_LEMP == true && $MODE == apply ]]; then
   info "Installing LEMP packages (nginx, php-fpm, mariadb-server, redis)..."
-  dnf install -y \
+  dnf install -y --skip-unavailable \
     nginx \
     php-cli php-fpm php-mysqlnd php-gd php-intl php-mbstring \
     php-xml php-bcmath php-sodium php-pecl-zip php-pecl-apcu php-opcache \
@@ -1253,7 +1272,9 @@ if [[ $INSTALL_LEMP == true && $MODE == apply ]]; then
     2>/dev/null || die "LEMP installation failed."
 
   systemctl enable --now nginx php-fpm mariadb redis
-  fixed "LEMP & Redis services started and enabled."
+  setsebool -P httpd_execmem 1 2>/dev/null || true
+  setsebool -P httpd_can_network_connect 1 2>/dev/null || true
+  fixed "LEMP & Valkey services started and enabled."
 fi
 
 if [[ $SECURE_MARIADB == true && $MODE == apply ]]; then
@@ -1267,30 +1288,25 @@ log_error = /var/log/mariadb/mariadb.log
 slow_query_log = 1
 slow_query_log_file = /var/log/mariadb/slow.log
 long_query_time = 2
-
 max_connections = $MAX_CONNS
 max_allowed_packet = 64M
 table_open_cache = $MARIADB_TABLE_OPEN_CACHE
+local_infile = 0
 innodb_buffer_pool_size = $INNODB_POOL
 innodb_log_file_size = 512M
 innodb_flush_log_at_trx_commit = 1
-innodb_file_per_table = 1
-
-local_infile = 0
-symbolic-links = 0
-
 innodb_flush_method = O_DIRECT
+innodb_file_per_table = 1
+innodb_thread_concurrency = 0
 innodb_io_capacity = 4000
 innodb_io_capacity_max = 4000
 innodb_read_io_threads = 8
 innodb_write_io_threads = 8
-innodb_buffer_pool_instances = $MARIADB_POOL_INSTANCES
-
+loose-innodb_buffer_pool_instances = $MARIADB_POOL_INSTANCES
+loose-symbolic-links = 0
 thread_handling = pool-of-threads
 thread_pool_size = $MARIADB_THREAD_POOL_SIZE
 thread_pool_max_threads = 2000
-innodb_thread_concurrency = 0
-
 skip-name-resolve
 tmp_table_size = 64M
 max_heap_table_size = 64M
@@ -1298,8 +1314,9 @@ EOF
 
   systemctl restart mariadb
 
-  mysql -e "DELETE FROM mysql.user WHERE User='';" 2>/dev/null || true
-  mysql -e "DELETE FROM mysql.user WHERE User='root' AND Host NOT IN ('localhost', '127.0.0.1', '::1');" 2>/dev/null || true
+  mysql -e "DROP USER IF EXISTS ''@'localhost';" 2>/dev/null || true
+  mysql -e "DROP USER IF EXISTS ''@'$(hostname)';" 2>/dev/null || true
+  mysql -e "DROP USER IF EXISTS 'root'@'%';" 2>/dev/null || true
   mysql -e "DROP DATABASE IF EXISTS test;" 2>/dev/null || true
   mysql -e "DELETE FROM mysql.db WHERE Db='test' OR Db='test\\_%';" 2>/dev/null || true
   mysql -e "FLUSH PRIVILEGES;" 2>/dev/null || true
@@ -1326,7 +1343,6 @@ rename-command CONFIG ""
 rename-command KEYS ""
 rename-command DEBUG ""
 io-threads $REDIS_IO_THREADS
-io-threads 8
 io-threads-do-reads yes
 activedefrag yes
 active-defrag-threshold-lower 20
@@ -1351,7 +1367,7 @@ fi
 section '8. Nginx Hardening & Custom WAF Rules Integration'
 
 if [[ $HARDEN_NGINX_PHP == true && $MODE == apply ]]; then
-  dnf install -y nginx-mod-http-brotli 2>/dev/null || true
+  dnf install -y nginx-mod-brotli 2>/dev/null || warn "nginx-mod-brotli missing – remove brotli lines from nginx.conf"
 
   write_managed /etc/nginx/nginx.conf 0644 <<EOF
 # Managed by server.sh (RAM-adaptive)
@@ -1359,6 +1375,8 @@ user nginx;
 worker_processes auto;
 error_log /var/log/nginx/error.log warn;
 pid /run/nginx.pid;
+worker_rlimit_nofile 65535;
+worker_shutdown_timeout 30s;
 
 include /usr/share/nginx/modules/*.conf;
 
@@ -1383,9 +1401,20 @@ http {
     sendfile            on;
     tcp_nopush          on;
     tcp_nodelay         on;
-    keepalive_timeout   65;
-    types_hash_max_size 4096;
+    keepalive_timeout   30;
     server_tokens       off;
+    client_body_timeout   10s;
+    client_header_timeout 10s;
+    send_timeout          10s;
+    limit_rate            2m;
+    types_hash_max_size 4096;
+    http2_max_concurrent_streams 128;
+
+    open_file_cache max=$NGINX_FILE_CACHE inactive=60s;
+    open_file_cache_valid 30s;
+    open_file_cache_min_uses 2;
+    open_file_cache_errors on;
+
     port_in_redirect    off;
     access_log          off;
     disable_symlinks    if_not_owner from=/home/;
@@ -1396,20 +1425,8 @@ http {
     client_max_body_size        32M;
     server_names_hash_bucket_size 128;
 
-    client_body_timeout   30s;
-    client_header_timeout 30s;
-    send_timeout          30s;
     keepalive_requests    500;
-
-    worker_rlimit_nofile 65535;
-    worker_shutdown_timeout 30s;
-
     ssl_buffer_size 4k;
-
-    open_file_cache max=$NGINX_FILE_CACHE inactive=60s;
-    open_file_cache_valid 30s;
-    open_file_cache_min_uses 2;
-    open_file_cache_errors on;
 
     # Real IP extraction
     set_real_ip_from 127.0.0.1;
@@ -1466,12 +1483,14 @@ http {
 
     map \$uri \$is_bad_probe {
         default 0;
+        "~/{3,}"            1;
+        "~^.{1000,}\$"      1;
         ~*^/.*\.(flv|mpg|mpeg|wmv|avi|asf|rm|ram)\$ 1;
         ~*/(?:wp-load|wp-activate|xmlrpc|wp-cron|wp-config|wp-configs)\.php(?:\?.*)?\$ 1;
         ~*^/(?:api/v1|v1/courses|engine/classes/min)(?:/|\$) 1;
         ~*^/(?:info|phpinfo|pinfo|xmlrpc|info|lite|about|wp|bolt|file|rip|cache|themes|abc|wpb|as|a|i|l|o|q|past|qq|p|w|x|u|adminer|inputs|adminfuns|alpha|alfacgiapi|BDKR28WP|bengi|gettest|x1da|ftde|less|oij98gy|turkshell|php|php8|kikikoko|fine|ass|zample|goods|bless4|fvvff|hplfuns|no18|byrgo|2026w|bthil|sadcut1|w2025|xqq|plss3|sbhu|file48|cabs|chosen|xwx1|class20|file18|file21|class19|simple|alfashell|motu|gssdd|bal|prv8|abcd|makeasmtp|hhxc|wkogn|ws80|fetch|eFpU3yHnriNNLtvdefault|oircv|xltt|4GrJSiwkF3A|hwjtry0zd1fzeakcuzn8Cdefault|cilus|oLEzRVqmJJPFSucdefault|wwdgl|option|num|nine2code|BhqKs28Cw94|3Cr1w6dfjTK|beerd|blnux|2nzyHnOkEg|7logs|maintura|wxeyc|n3yUmQ6Q9xwQ8ocdefault|fyflv|Geforces3FiyJ2WGCnF0p1default|p14rAeWytPdH5hZcscCFdefault|iee52ruz0s81ndrdefault|nvwf4svpvqohxdjtbjCdefault|xxiviLDIot|upll22|5tdwvyWnTbRiMS8f18HXNBbALHKB5t4j|CDX1|gvg1bvpsgtot1rpklCdefault|tx79|wtiiy|Sanskrit|amax|jga|ta0ol|classwithtostring|gecko|xmrlpc|byp403|bypass|byps|atomlib|anonsec|anons79|alfanew|alwso|alfa123|batm|autoload|compat|dropdown|db|docindex|doc|dev|eagle|exploit|evil|fierza|hello|idx|haxor|green|flame|foxx|filemanager|indoxploit|jindex|install|leaf|mail|MARIJUANA|minishellfile2|moon|anon|base|black|config|content|xleet|radio|qindex|readme|send|seo|shx|shl|unknown|upfile|tinyfilemanager|vuln|plugins|wso|about|zone|gelay|mrjn|priv|root|style|symlink|upgrade|flower|lock360|wsanon)(?:\.php.*)?\$ 1;
         ~*^/(?:_?phpinfo(?:\.php.*)?|server-info)\$ 1;
-        ~*^/(?:wp-admin|wp-config|gecko-new|autoload_classmap|gravitysmtp-settings|wp-fmfile|wpsite|old|wp|main|new|test|shop|wp-content|swagger|webjars|v2|v3|debug|wp-includes|console|backup|wordpress|cms|checkout|cart|loader|panel|laravel|administrator|adminstrator|server|yii|zend|vendor|rss|feed|blog|fileupload|tinymce|webroot|editor|filemanager|ckeditor|kcfinder|assets|asset|blog|plugins|cgi-bin)/ 1;
+        ~*^/(?:wp-admin|wp-config|gecko-new|autoload_classmap|gravitysmtp-settings|wp-fmfile|wpsite|old|wp|main|new|test|shop|wp-content|swagger|webjars|v2|v3|debug|wp-includes|console|backup|wordpress|cms|checkout|cart|loader|panel|laravel|administrator|adminstrator|server|yii|zend|vendor|rss|feed|blog|fileupload|tinymce|webroot|editor|filemanager|ckeditor|kcfinder|blog|plugins|cgi-bin)/ 1;
         ~*^/(?:wp-access|wp-conctent|wp-atom|wp-files|wp-mails|wp-trackback|wp-signup|wp-blog|wp-update|wp-login|wpsite)(?:\.php.*)?\$ 1;
         ~*^/(?:config|configuration|settings|database|secrets|webresource)(?:\.(?:php|json|ini|yml|yaml|axd).*)?\$ 1;
         ~*^/.+/(?:config|configuration|settings|database|secrets|webresource)(?:\.(?:php|json|ini|yml|yaml|axd).*)?\$ 1;
@@ -1485,10 +1504,14 @@ http {
 
     map \$http_user_agent \$is_bad_ua {
         default 0;
-        ""              1;
-        "~^.{0,12}\$"    1;
-        "~^.{450,}\$"    1;
-        "~*\""          1;
+        ""                1;
+        "~^.{0,10}\$"     1;
+        "~^.{450,}\$"     1;
+        "~*\""            1;
+        "~*sqlmap"        1;
+        "~*nikto"         1;
+        "~*nmap"          1;
+        "~*masscan"       1;
         "~*(bingbot|googlebot|yandexbot|applebot|duckduckbot|coccocbot)" 0;
         "~*(spider_bot|xaldon|wayback_machine|adbeat(_bot|\.com)|commoncrawl|bidtellect|pwaminicanvas|rddocuments|sonic|spotify|atcontent|falcontag|bullettag|openwave|kyvys|thunder|metaiab|jssdk|bytelocale|acvxyjv|voxelum|sessionid|minecraft|cachepos|vxldsihsp|sitecheck|sitecrawl|cherrystudio|opengraph|alamofire|qtwebengine|aippy|v2raytun|liebaofast|undici|deepseek|arenaunfurl|businessname|activedomaincollector|celturbo|imagefetcher|cravingexplorer|oai-search|adint-transparency|manus-user|wap-|check-access|wp-|dnt-policy|pr-cy|3gpp-gba|rwth-aachen|iab-tech|ttd-content|psi-exam|cms-checker|gvfs/|ptst/|boring-searchbot|unity)" 1;
         "~*(ibou(bot|\.io)|comscore|halobot|sirdata|weborama|b11pre|kraken|pubmagadscanner|tineye|jusprogdns|slurp|taboola|jobboerse|voilabot|jyxobot|exabot|zgrab|proximi|sosospider|photon|ultrablock|loilonote|remo|voluumdsp|kozmonavt|domainsbot|academicbotrtu|accoona|aihitbot|genieo|onespot|bytedance|becomebot|cyberokinspect|aliyun|nerdybot|embedly|doesitrunon|subscribe|slbchan|backrub|blowfishi|thresselscanner|cherrypicker|cyberspyder|emailcollector|foobot|geturl|links|vizio|fancyplayer|watchfree|saucenao|notebooklm|letsearch|openbot|snooper|superbot|heritrix|urlspider|mazbot|echoboxbot|serendeputy|zoombot|ffzbot|manictime|infopath|palmsource|libmpv|msie|twitter|foremedia|nimbostratus|bidswitch|statsbot|telegram|cfnetwork|inetdex|openvas|kazbtbot|anytypebot|pocket|githack|sindresorhus|sonyericsson|nokiae|nutch|snapshot|b4pre|slack|cincraw|dalvik|viber|presto|senutobot|imagesift|nokian|windvane|barkrowler|syncsearch|sitemap|nicheiq|geedoproduct|adfitpm|analytics|sffeedreader|generator|riddler|ezlynx|fullstorybot|internetmeasurement|dataxu|shikimori|newsai|metasr|tattoo-ai|dataset|portalmmm|itunes|jigsaw|emailwolf|netfront|everyfeed|censysinspect|smtbot|similartech|teletalk|abevalbot|sucrose|openintel|blexbot|obsidian|seranking|flyriverbot|zoominfobot|yak|freebsd|iaskbot|skype|sleep|nbertaupete95|outclicksbot|jikespider|gigabot|catchbot|chatglm|huaweisymantec|aitcsroboti|bpimagewalker|checkhost|check-host|hanaleibot|bitsightbot|brightbot|securityheaders|nuclei|arachnophilia|livelapbot|linkfluence|tweetmemebot|linkisbot|crowdtanglebot|sitesnagger|teleportpro|webcopier|zerohitman|webreaper|webstripper|priecobot|arquivo|crawler|notion|urllib|yeti|netcraft|startmebot|xenforo|youbot|seekport|pandalytics|feedburner|amazon|diffbot|backupland|dlvr|openbsd|netbsd|code|revoltchat|yisouspider|validator|getintent|snapchat|embarcadero|seopult|textrazor|scholarbot|mojeekbot|slbvpv|micromessenger|wechat|quarkpc|bitrix|contxbot|plurkbot|paperlibot|bomborabot|observer|leikibot|wpsmoffice|urldetails|comcastappplatform|firebolt|ntentbot|headline|clickagy|aspiegelbot|tkbot|checkmarknetwork|ccbot|mauibot|gumgum|thinkchaos|kstandbot|warc|zeno|nmap|signalrgbclient|statdom|admantx|seokicks|dotbot|cliqzbot|nintendo|scrap|builtwith|timpibot|sentibot|vagabondo|piccollage|instagram|netestate|steamchat|csscheck|awariosmart|semantici|eyeotabot)" 1;
@@ -1509,6 +1532,8 @@ http {
 }
 EOF
 
+  nginx -t && systemctl reload nginx || warn "nginx -t failed – check /etc/nginx/nginx.conf"
+
   write_managed /etc/php.d/99-security.ini 0644 <<EOF
 ; Managed by server.sh (RAM-adaptive OPcache & security settings)
 expose_php = Off
@@ -1518,14 +1543,12 @@ log_errors = On
 error_reporting = E_ALL & ~E_DEPRECATED & ~E_STRICT
 allow_url_fopen = Off
 allow_url_include = Off
-disable_functions = exec,passthru,shell_exec,system,proc_open,popen,curl_exec,curl_multi_exec,parse_ini_file,show_source
+disable_functions = passthru,system,show_source
 session.cookie_httponly = 1
 session.cookie_secure = 1
 session.cookie_samesite = Strict
 session.use_strict_mode = 1
 session.use_only_cookies = 1
-session.sid_length = 48
-session.sid_bits_per_character = 6
 session.upload_progress.enabled = Off
 opcache.memory_consumption = ${OPCACHE_MEM}
 opcache.interned_strings_buffer = 32
@@ -1542,7 +1565,7 @@ fi
 # ===========================================================================
 # 9. FAIL2BAN CONFIGURATION & FILTERS DEPLOYMENT
 # ===========================================================================
-section '10. Fail2ban configuration & Filter setup'
+section '9. Fail2ban configuration & Filter setup'
 
 if [[ $ENABLE_FAIL2BAN == true && $MODE == apply ]]; then
   dnf install -y fail2ban fail2ban-firewalld 2>/dev/null || true
@@ -1578,6 +1601,9 @@ failregex = ^<HOST> - .*? "(GET|POST|HEAD|OPTIONS|PROPFIND) \S+ HTTP/\d\.\d" (44
 ignoreregex = ^<HOST> - .*? "(GET|POST|HEAD|OPTIONS|PROPFIND) \S+ HTTP/\d\.\d" (444|400) \d+ .* "(?:[^"]*(?:Googlebot|coccocbot|bingbot|YandexBot|DuckDuckBot)[^"]*)"
 EOF
 
+  install -d -m 0755 /var/log/nginx
+  [[ -e /var/log/nginx/probe.log ]] || install -m 0640 /dev/null /var/log/nginx/probe.log
+
   write_managed /etc/fail2ban/jail.local 0644 <<EOF
 # Managed by server.sh
 [DEFAULT]
@@ -1598,20 +1624,22 @@ bantime  = 4h
 [nginx-http-auth]
 enabled  = true
 port     = http,https
-logpath  = /var/log/nginx/error.log
+backend  = auto
+logpath  = /home/vhosts/*/logs/error.log
 
 [nginx-limit-req]
 enabled  = true
 port     = http,https
 filter   = nginx-limit-req
-logpath  = /var/log/nginx/error.log
+backend  = auto
+logpath  = /home/vhosts/*/logs/error.log
 maxretry = 10
 
 [nginx-anyrequest]
 enabled  = true
 port     = http,https
 filter   = nginx-anyrequest
-logpath  = /home/*/logs/nginx/error.log
+logpath  = /home/vhosts/*/logs/error.log
 backend  = auto
 findtime = 20m
 maxretry = 100
@@ -1622,7 +1650,7 @@ ignoreip = 127.0.0.1/8 ::1
 enabled  = true
 port     = http,https
 filter   = nginx-ddos
-logpath  = /home/*/logs/nginx/access.log
+logpath  = /home/vhosts/*/logs/access.log
 backend  = auto
 findtime = 10m
 maxretry = 500
@@ -1633,7 +1661,7 @@ ignoreip = 127.0.0.1/8 ::1
 enabled  = true
 port     = http,https
 filter   = nginx-download
-logpath  = /home/*/logs/nginx/access.log
+logpath  = /home/vhosts/*/logs/access.log
 backend  = auto
 findtime = 10m
 maxretry = 300
@@ -1644,7 +1672,7 @@ ignoreip = 127.0.0.1/8 ::1
 enabled  = true
 port     = http,https
 filter   = nginx-guard
-logpath  = /home/*/logs/nginx/access.log
+logpath  = /home/vhosts/*/logs/access.log
 backend  = auto
 findtime = 10m
 maxretry = 100
@@ -1656,6 +1684,7 @@ enabled  = true
 port     = http,https
 filter   = nginx-probe
 logpath  = /var/log/nginx/probe.log
+backend  = auto
 findtime = 10m
 maxretry = 5
 bantime  = 48h
@@ -1664,6 +1693,110 @@ EOF
 
   systemctl enable --now fail2ban
   fixed "Fail2ban active with all custom WAF/DDoS filters."
+fi
+
+# ===========================================================================
+# 10. NFTABLES & SYNPROXY SETUP
+# ===========================================================================
+section '10. SYNPROXY & Low-Level Protection'
+
+if [[ $MODE == apply ]]; then
+  modprobe nf_synproxy_core 2>/dev/null || true
+  
+  write_managed /etc/sysconfig/nftables.conf 0600 <<'EOF'
+flush ruleset
+
+table inet synproxy_protection
+delete table inet synproxy_protection
+
+table inet synproxy_protection {
+    chain prerouting {
+        type filter hook prerouting priority raw; policy accept;
+        tcp dport { 80, 443 } tcp flags syn notrack
+    }
+    chain input {
+        type filter hook input priority filter - 1; policy accept;
+        tcp dport { 80, 443 } ct state { invalid, untracked } synproxy mss 1460 wscale 7 timestamp sack-perm
+        tcp dport { 80, 443 } ct state invalid drop
+    }
+}
+EOF
+
+  systemctl enable --now nftables 2>/dev/null || true
+  fixed "NFTables SYNPROXY configured."
+fi
+
+# ===========================================================================
+# 11. CROWDSEC & BOUNCER INTEGRATION
+# ===========================================================================
+section '11. CrowdSec Setup'
+
+if [[ $ENABLE_CROWDSEC == true && $MODE == apply ]]; then
+  curl -s https://install.crowdsec.net | bash >/dev/null 2>&1 || true
+  dnf install -y crowdsec crowdsec-firewall-bouncer-nftables 2>/dev/null || warn "CrowdSec packages not installed"
+
+  systemctl enable --now crowdsec 2>/dev/null || true
+  systemctl enable --now crowdsec-firewall-bouncer 2>/dev/null || true
+
+  if command -v cscli &>/dev/null; then
+    cscli collections install crowdsecurity/nginx >/dev/null 2>&1 || true
+    cscli collections install crowdsecurity/linux >/dev/null 2>&1 || true
+    install -d -m 0755 /etc/crowdsec/acquis.d
+    cat > /etc/crowdsec/acquis.d/nginx.yaml <<'ACQ'
+filenames:
+  - /home/vhosts/*/logs/access.log
+  - /home/vhosts/*/logs/error.log
+labels:
+  type: nginx
+ACQ
+    systemctl reload crowdsec 2>/dev/null || true
+    fixed "CrowdSec community WAF active."
+  fi
+fi
+
+# ===========================================================================
+# 12. FWKNOP SETUP (OPTIONAL PORT KNOCKING)
+# ===========================================================================
+if [[ $ENABLE_FWKNOP == true && $MODE == apply ]]; then
+  section '12. FWKNOP Setup'
+  dnf install -y fwknop-server 2>/dev/null || warn "fwknop-server not available"
+  SPA_KEY=$(openssl rand -base64 32)
+  SPA_HMAC_KEY=$(openssl rand -base64 32)
+
+  write_managed /etc/fwknop/access.conf 0600 <<EOF
+SOURCE              ANY
+REQUIRE_SOURCE_ADDRESS Y
+KEY_BASE64          $SPA_KEY
+HMAC_KEY_BASE64     $SPA_HMAC_KEY
+OPEN_PORTS          tcp/$SSH_PORT
+FW_ACCESS_TIMEOUT   30
+EOF
+
+  DEFAULT_IFACE=$(ip route show default | awk '/default/ {print $5}' | head -n1)
+  write_managed /etc/fwknop/fwknopd.conf 0600 <<EOF
+PCAP_INTF           ${DEFAULT_IFACE:-eth0};
+ENABLE_IPT_FORWARDING N;
+EOF
+
+  systemctl enable --now fwknopd 2>/dev/null || true
+  fixed "FWKNOP configured."
+fi
+
+# ===========================================================================
+# 13. SELINUX ENFORCING
+# ===========================================================================
+section '13. SELinux Enforcement'
+
+if command -v getenforce &>/dev/null; then
+  if [[ $(getenforce) != "Enforcing" ]]; then
+    if [[ $MODE == apply ]]; then
+      setenforce 1 || true
+      sed -i 's/^SELINUX=.*/SELINUX=enforcing/' /etc/selinux/config
+      fixed "SELinux switched to Enforcing mode."
+    fi
+  else
+    ok "SELinux is in Enforcing mode."
+  fi
 fi
 
 # ===========================================================================
