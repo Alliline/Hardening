@@ -31,7 +31,7 @@ powershell.exe -ExecutionPolicy Bypass -File "C:\windows.ps1" -Mode Apply
 ```
 - Протестировано: 18.10.2026 на Windows 25H2 (26200.9711).
 
-## Router: Asus BQ16
+## Lab (Router): Asus BQ16
 ```
 chmod +x ./asus.sh
 ./asus.sh 
@@ -39,6 +39,22 @@ chmod +x ./asus.sh
 - Настраивает VLAN на eth2 (порт LAN 10G) + фаервол + маскарадинг, отключает лишние сервисы.
 - Для прошивки AM-Reaper (которая отчасти Asus-Merlin). 
 - Протестировано: 19.10.2026 на 3006.102.8_Reaper_v3.4.6_BETA_noMCP.
+
+## Lab (NAS): Proxmox
+```
+chmod +x ./proxmox.sh
+./proxmox.sh 
+```
+- Меняет стандартные порты на кастомные, добавляет пользователя, повышает безопасность ядра и тд.
+- Парсит лежащий id_rsa.pub, добавляет в ssh root (nopass). 
+- Протестировано: 26.10.2026 на Proxmox 9.2 (7.0.2-6-pve).
+
+## Web / Lab (LAMP): Fedora Server 44/45
+```
+chmod +x ./server.sh
+./server.sh 
+```
+- Предварительная версия, НЕ ТЕСТИРОВАЛАСЬ, НЕ ЗАПУСКАЛАСЬ!
 
 ## Web: Cloudpanel
 ```
