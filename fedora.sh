@@ -198,7 +198,7 @@ setup_sublime_text() {
     
     if [[ ! -f "$pc_file" || ! -s "$pc_file" ]]; then
       info "Downloading Package Control 4..."
-      sudo -u "$real_user" curl -sSLo "$pc_file" "https://download.sublimetext.com/Package%20Control.sublime-package" 2>/dev/null || true
+      sudo -u "$real_user" curl -sSLo "$pc_file" "https://packagecontrol.io/Package%20Control.sublime-package" 2>/dev/null || true
     else
       info "Package Control 4 already exists, skipping download."
     fi
@@ -541,8 +541,8 @@ FIREFOX_PREFS_EOF
 
   # Flatpak Firefox reads system policy from its systemconfig extension path.
   local arch branch pol_dir
-  arch=$(sudo -u "$real_user" flatpak info --show-arch org.mozilla.firefox 2>/dev/null || printf 'x86_64')
-  branch=$(sudo -u "$real_user" flatpak info --show-branch org.mozilla.firefox 2>/dev/null || printf 'stable')
+  arch=$(flatpak --default-arch 2>/dev/null || printf 'x86_64')
+  branch=stable
   pol_dir="/var/lib/flatpak/extension/org.mozilla.firefox.systemconfig/${arch}/${branch}/policies"
   install -d -m 0755 "$pol_dir"
   backup_file "$pol_dir/policies.json"
@@ -618,7 +618,6 @@ FIREFOX_PREFS_EOF
       "Category": "strict"
     },
     "Cookies": {
-      "Default": false,
       "AcceptThirdParty": "never",
       "Locked": false
     },
@@ -896,7 +895,11 @@ if command -v grubby &>/dev/null; then
 
   if [[ $MODE == apply ]]; then
     all_current_args=$(grubby --info=DEFAULT 2>/dev/null | grep '^args=' | cut -d= -f2- | tr -d '"' || true)
-    if [[ -n "$all_current_args" ]]; then
+    default_root=$(grubby --info=DEFAULT 2>/dev/null | sed -n 's/^root="\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' | head -n1 || true)
+    if [[ -n "$default_root" && "$all_current_args" != *"root="* ]]; then
+      all_current_args="root=${default_root} ${all_current_args}"
+    fi
+    if [[ "$all_current_args" == *"root="* ]]; then
       echo "$all_current_args" > /etc/kernel/cmdline
       chmod 0600 /etc/kernel/cmdline
       fixed "Updated /etc/kernel/cmdline for kernel-install persistence"
@@ -986,8 +989,6 @@ services_to_mask=(
   systemd-coredump.socket
   systemd-coredump@.service
   debug-shell.service
-  emergency.service
-  rescue.service
   iscsid.service
   iscsi.service
   lvm2-monitor.service
@@ -1077,12 +1078,12 @@ elif [[ $MODE == apply ]]; then
     if grep -q 'AutoEnable=' "$BT_CONF"; then
       sed -i 's/^#\?[[:space:]]*AutoEnable=.*/AutoEnable=false/' "$BT_CONF"
     else
-      sed -i '/^\[General\]/a AutoEnable=false' "$BT_CONF" || \
-        printf '\n[General]\nAutoEnable=false\n' >> "$BT_CONF"
+      sed -i '/^\[Policy\]/a AutoEnable=false' "$BT_CONF" || \
+        printf '\n[Policy]\nAutoEnable=false\n' >> "$BT_CONF"
     fi
   else
     cat > "$BT_CONF" <<'EOF'
-[General]
+[Policy]
 AutoEnable=false
 EOF
   fi
@@ -1111,6 +1112,7 @@ if command -v firewall-cmd &>/dev/null; then
 
   if [[ $MODE == apply ]]; then
     firewall-cmd --permanent --zone=public --set-target=DROP 2>/dev/null || true
+    firewall-cmd --set-default-zone=public 2>/dev/null || true
     firewall-cmd --permanent --zone=public --remove-service=mdns 2>/dev/null || true
     firewall-cmd --permanent --zone=public --remove-service=ssh 2>/dev/null || true
 
@@ -1224,11 +1226,10 @@ fs.protected_regular = 2
 fs.protected_fifos = 2
 fs.protected_hardlinks = 1
 fs.protected_symlinks = 1
-fs.protected_symlinks_create = 1
-fs.protected_hardlinks_create = 1
 
 # === Anti-info-leak & Performance micro-tweaks ===
-kernel.pid_max = 65536
+kernel.pid_max = 4194304
+vm.max_map_count = 1048576
 vm.mmap_min_addr = 65536
 kernel.perf_cpu_time_max_percent = 1
 kernel.sched_schedstats = 0
@@ -1236,8 +1237,6 @@ kernel.timer_migration = 0
 net.core.bpf_jit_kallsyms = 0
 kernel.ftrace_enabled = 0
 kernel.stack_tracer_enabled = 0
-net.ipv4.conf.all.mc_forwarding = 0
-net.ipv6.conf.all.mc_forwarding = 0
 SYSCTL_EOF
 )
 
@@ -1417,7 +1416,9 @@ if command -v getenforce &>/dev/null; then
     b_name="${bool_setting%%=*}"
     b_val="${bool_setting##*=}"
     if command -v getsebool &>/dev/null; then
-      cur_bool=$(getsebool "$b_name" 2>/dev/null | awk '{print $3}')
+      cur_bool=$(getsebool "$b_name" 2>/dev/null | awk '{print $3}' || true)
+      [[ "$cur_bool" == on ]] && cur_bool=1
+      [[ "$cur_bool" == off ]] && cur_bool=0
       if [[ "$cur_bool" == "$b_val" ]]; then
         ok "SELinux boolean $b_name is $b_val"
       elif [[ $MODE == apply ]]; then
@@ -1463,13 +1464,6 @@ install p8022 /bin/false
 install p8023 /bin/false
 install psnap /bin/false
 install n_hdlc /bin/false
-install llc /bin/false
-install bridge /bin/true
-install veth /bin/true
-install tun /bin/true
-install tap /bin/true
-install vxlan /bin/true
-install geneve /bin/true
 
 # === Legacy file systems (particularly dangerous during extraction) ===
 install cramfs /bin/false
@@ -1491,16 +1485,6 @@ install jfs /bin/false
 install reiserfs /bin/false
 install nilfs2 /bin/false
 install f2fs /bin/false
-# We’re keeping the modern ones:
-install ext4 /bin/true
-install xfs /bin/true
-install btrfs /bin/true
-install overlay /bin/true
-install fuse /bin/true
-install vfat /bin/true
-install exfat /bin/true
-install ntfs3 /bin/true
-install squashfs /bin/true
 
 # === Legacy hardware (Z790/Z890 — none of this is present on the boards) ===
 install floppy /bin/false
@@ -1690,7 +1674,7 @@ if [[ $PURGE_GNOME_BLOAT == true ]]; then
       ok "GNOME app already absent: $pkg"
     fi
   done
-  if rpm -qa 'libreoffice*' &>/dev/null; then
+  if [[ -n "$(rpm -qa 'libreoffice*')" ]]; then
     if [[ $MODE == apply ]]; then
       dnf remove -y 'libreoffice*' 2>/dev/null || true
       fixed "Removed all LibreOffice packages"
@@ -1827,7 +1811,7 @@ EE_EOF
   # Apply browser hardening after possible installation
   if [[ $MODE == apply ]]; then
     REAL_USER=$(resolve_real_user)
-    USER_HOME=$(getent passwd "$REAL_USER" | cut -d: -f6)
+    USER_HOME=$(getent passwd "$REAL_USER" | cut -d: -f6 || true)
     if [[ -n "$REAL_USER" && "$REAL_USER" != "root" && -d "$USER_HOME" ]]; then
       setup_firefox_prefs "$REAL_USER" "$USER_HOME"
       setup_chromium_prefs "$REAL_USER" "$USER_HOME"
@@ -1844,7 +1828,7 @@ fi
 # Always attempt browser hardening in apply mode even if software install was skipped
 if [[ $MODE == apply ]]; then
   REAL_USER=$(resolve_real_user)
-  USER_HOME=$(getent passwd "$REAL_USER" | cut -d: -f6)
+  USER_HOME=$(getent passwd "$REAL_USER" | cut -d: -f6 || true)
   if [[ -n "$REAL_USER" && "$REAL_USER" != "root" && -d "$USER_HOME" ]]; then
     setup_firefox_prefs "$REAL_USER" "$USER_HOME"
     setup_chromium_prefs "$REAL_USER" "$USER_HOME"
@@ -1882,7 +1866,7 @@ if [[ $INSTALL_HARDENED_MALLOC == true ]]; then
     cd "$WORK_DIR"
 
     info "Downloading latest GrapheneOS hardened_malloc source..."
-    if curl -sL "$REPO_URL" -o source.tar.gz; then
+    if curl -fsSL "$REPO_URL" -o source.tar.gz; then
       NEW_HASH=$(sha256sum source.tar.gz | awk '{print $1}')
       OLD_HASH=""
       [[ -f "$HASH_FILE" ]] && OLD_HASH=$(cat "$HASH_FILE")
@@ -1936,7 +1920,7 @@ if [[ $INSTALL_HARDENED_MALLOC == true ]]; then
         --socket=pulseaudio \
         --talk-name=org.freedesktop.Notifications \
         --talk-name=org.freedesktop.secrets \
-        --talk-name=org.freedesktop.portal.* \
+        '--talk-name=org.freedesktop.portal.*' \
         2>/dev/null || true
       fixed "Global Flatpak defaults applied (hardened_malloc + strict base)"
 
@@ -1965,7 +1949,7 @@ if [[ $INSTALL_HARDENED_MALLOC == true ]]; then
             --socket=pulseaudio \
             --talk-name=org.freedesktop.Notifications \
             --talk-name=org.freedesktop.secrets \
-            --talk-name=org.freedesktop.portal.* \
+            '--talk-name=org.freedesktop.portal.*' \
             --env=LD_PRELOAD="$LIB_DEST" \
             2>/dev/null || true
           fixed "Strict browser sandbox applied: $browser"
@@ -2099,7 +2083,7 @@ if [[ "$SETUP_GNOME_LAYOUT" == true ]]; then
   if [[ "$IS_DESKTOP" == true ]]; then
     REAL_USER=$(resolve_real_user)
     
-    USER_HOME=$(getent passwd "$REAL_USER" | cut -d: -f6)
+    USER_HOME=$(getent passwd "$REAL_USER" | cut -d: -f6 || true)
     USER_UID=$(id -u "$REAL_USER" 2>/dev/null || echo 1000)
     
     if [[ -n "$REAL_USER" && "$REAL_USER" != "root" && -d "$USER_HOME" ]]; then
