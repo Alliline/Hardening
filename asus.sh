@@ -290,13 +290,13 @@ for iface in br0 br10 br20 br30 br40; do
 done
 
 # Allow management access only from Trusted VLAN.
-for port in 22 80 443 4444 4443; do
+for port in 22 80 443 445 3389 4444 4443 9090 8006; do
     "$IPT" -A HOMELAB_INPUT -i br10 \
         -p tcp --dport "$port" -j ACCEPT
 done
 
 # Block router management ports from every other interface.
-for port in 22 80 443 4444 4443; do
+for port in 22 80 443 445 3389 4444 4443 9090 8006; do
     "$IPT" -A HOMELAB_INPUT \
         -p tcp --dport "$port" -j DROP
 done
@@ -348,15 +348,14 @@ done
 "$IPT" -A HOMELAB_ISO -i br10 -o br0 -j ACCEPT
 
 # Allow Trusted VLAN to access selected SemiTrusted VLAN services.
-for port in 22 4444 4443 11434; do
+for port in 22 445 3389 4444 11434; do
     "$IPT" -A HOMELAB_ISO -i br10 -o br20 \
         -p tcp --dport "$port" -j ACCEPT
 done
 
-# Allow SemiTrusted VLAN to access the NAS using NFSv4.
-# Enable this rule only if the Proxmox host actually exports NFS.
+# Allow SemiTrusted VLAN to access using SMB, NFSv4, RDP.
 "$IPT" -A HOMELAB_ISO -i br20 -o br10 \
-    -d "$NAS_IP" -p tcp --dport 2049 -j ACCEPT
+    -d "$NAS_IP" -p tcp -m multiport --dports 445,2049,3389 -j ACCEPT
 
 # Block all other new connections between Trusted and SemiTrusted.
 "$IPT" -A HOMELAB_ISO -i br10 -o br20 -j DROP
