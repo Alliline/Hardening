@@ -36,6 +36,17 @@ WDNS_NFT_FLUSH="$WDNS_DIR/flush-nft.sh"
 WDNS_ENSURE_SCRIPT="$WDNS_DIR/ensure.sh"
 NM_DISPATCHER_SCRIPT="/etc/NetworkManager/dispatcher.d/90-wdns-force-dns"
 
+# --- Per-app DoH bypass (opt-in via: bypass-setup) ---
+# Идентификация приложения — по GID (nft: meta skgid). Приложение запускается
+# через `sg wdns-bypass`; для этой группы открыт ТОЛЬКО tcp/443 на IP из
+# BYPASS_IPS_FILE. Порты 53/853 и остальные DoH-IP для неё остаются закрытыми.
+BYPASS_GROUP="wdns-bypass"
+BYPASS_IPS_FILE="$WDNS_DIR/bypass-doh-ips.txt"
+BYPASS_APP_ID="${BYPASS_APP_ID:-io.gitlab.librewolf-community}"
+BYPASS_DOH_URI="${BYPASS_DOH_URI:-https://1.1.1.1/dns-query}"
+BYPASS_LAUNCHER="/usr/local/bin/wdns-bypass-librewolf"
+BYPASS_DESKTOP_NAME="wdns-bypass-librewolf.desktop"
+
 # IPv4 loopback only. IPv6 is fully disabled.
 LISTEN_ADDRESSES="127.0.0.1"
 DEFAULT_DNS_SERVERS="${DEFAULT_DNS_SERVERS:-1.1.1.1,1.0.0.1}"
@@ -88,6 +99,8 @@ validate_dns_server() {
   fi
   return 1
 }
+
+validate_ipv4() { validate_dns_server "$1"; }
 
 ensure_paths() {
   mkdir -p "$WDNS_DIR" "$DNSMASQ_CONF_DIR" "$NM_CONF_DIR" "$RESOLVED_DROPIN_DIR"
@@ -456,6 +469,27 @@ render_nft_rules() {
   done < "$DOH_IPSET_FILE"
   ip_elements="${ip_elements%,}"
 
+  # --- bypass: активен только если группа существует и есть валидные IP ---
+  local bypass_gid bypass_elements="" bypass_set_block="" bypass_rule="" bip
+  bypass_gid="$(getent group "$BYPASS_GROUP" 2>/dev/null | cut -d: -f3 || true)"
+  if [[ -n "$bypass_gid" && -f "$BYPASS_IPS_FILE" ]]; then
+    while IFS= read -r bip || [[ -n "$bip" ]]; do
+      bip="$(echo "$bip" | sed 's/[[:space:]]*#.*$//' | xargs || true)"
+      [[ -z "$bip" ]] && continue
+      if validate_ipv4 "$bip"; then
+        bypass_elements+=" $bip,"
+      else
+        warn "Skipped invalid bypass IP: $bip"
+      fi
+    done < "$BYPASS_IPS_FILE"
+    bypass_elements="${bypass_elements%,}"
+  fi
+  if [[ -n "$bypass_gid" && -n "$bypass_elements" ]]; then
+    bypass_set_block=$'  set bypass_doh_ips {\n    type ipv4_addr\n    elements = {'"$bypass_elements"$' }\n  }\n'
+    bypass_rule=$'    # Per-app DoH bypass: только группа '"$BYPASS_GROUP"$', только tcp/443 на выбранные IP\n    meta skgid '"$bypass_gid"$' ip daddr @bypass_doh_ips tcp dport 443 counter accept\n\n'
+    log "nftables: DoH bypass enabled for group $BYPASS_GROUP (gid $bypass_gid)"
+  fi
+
   cat > "$WDNS_NFT_FILE" <<EOF_NFT
 table inet wdns_whitelist {
   set doh_ips {
@@ -463,7 +497,7 @@ table inet wdns_whitelist {
     flags interval
     elements = { ${ip_elements} }
   }
-
+${bypass_set_block}
   chain output {
     type filter hook output priority 0; policy accept;
 
@@ -478,7 +512,7 @@ table inet wdns_whitelist {
     oifname "lo" udp dport 53 accept
     oifname "lo" tcp dport 53 accept
 
-    # Блокируем прямой уход DNS наружу для всех остальных
+${bypass_rule}    # Блокируем прямой уход DNS наружу для всех остальных
     udp dport 53 drop
     tcp dport 53 drop
     tcp dport 853 drop
@@ -592,12 +626,7 @@ EOF_RESOLV
 chmod 0644 "$RESOLV_CONF"
 chattr +i "$RESOLV_CONF" 2>/dev/null || true
 
-# 1b. Гарантируем, что resolved смотрит только в dnsmasq
-if [[ -f /etc/systemd/resolved.conf.d/90-wdns-disable-stub.conf ]]; then
-  systemctl restart systemd-resolved.service 2>/dev/null || true
-fi
-
-# 2. Повторно форсим DNS на всех NM-соединениях
+# 2. Повторно форсим DNS на всех NM-соединениях (после reboot профили иногда «забывают»)
 if command -v nmcli >/dev/null 2>&1; then
   while IFS= read -r conn; do
     [[ -z "$conn" ]] && continue
@@ -683,7 +712,158 @@ EOF_UNIT
   chmod 0644 "/etc/systemd/system/$WDNS_ENSURE_SERVICE"
 }
 
+write_default_bypass_ips() {
+  [[ -f "$BYPASS_IPS_FILE" ]] && return 0
+  cat > "$BYPASS_IPS_FILE" <<'EOF_BIPS'
+# DoH-серверы, доступные ТОЛЬКО группе wdns-bypass (tcp/443).
+# Один IPv4 на строку. Держите список минимальным.
+# Должен содержать IP из BYPASS_DOH_URI (по умолчанию https://1.1.1.1/dns-query).
+1.1.1.1
+1.0.0.1
+EOF_BIPS
+  chmod 0644 "$BYPASS_IPS_FILE"
+}
+
+bypass_target_user() {
+  local u="${SUDO_USER:-}"
+  if [[ -z "$u" || "$u" == "root" ]] || ! id "$u" >/dev/null 2>&1; then
+    err "Run via sudo from your regular user (SUDO_USER is empty or root)"
+    exit 1
+  fi
+  echo "$u"
+}
+
+bypass_cleanup_files() {
+  getent group "$BYPASS_GROUP" >/dev/null 2>&1 && groupdel "$BYPASS_GROUP" 2>/dev/null || true
+  rm -f "$BYPASS_LAUNCHER"
+  local u="${SUDO_USER:-}" h
+  if [[ -n "$u" && "$u" != "root" ]]; then
+    h="$(getent passwd "$u" | cut -d: -f6 || true)"
+    [[ -n "$h" ]] && rm -f "$h/.local/share/applications/$BYPASS_DESKTOP_NAME"
+  fi
+}
+
+bypass_setup() {
+  require_root
+  require_cmd nft
+  require_cmd sg
+  require_cmd getent
+  require_cmd runuser
+  [[ -f "$STATE_FILE" ]] || { err "Run 'apply' first"; exit 1; }
+  ensure_paths
+
+  local user home profile doh_host
+  user="$(bypass_target_user)"
+  home="$(getent passwd "$user" | cut -d: -f6)"
+  profile="$home/.var/app/$BYPASS_APP_ID/data/wdns-bypass-profile"
+
+  if ! runuser -u "$user" -- flatpak info "$BYPASS_APP_ID" >/dev/null 2>&1; then
+    warn "Flatpak app $BYPASS_APP_ID not found for user $user (continuing)"
+  fi
+
+  if [[ ! "$BYPASS_DOH_URI" =~ ^https://[0-9.]+(:[0-9]+)?/[A-Za-z0-9._/-]*$ ]]; then
+    err "BYPASS_DOH_URI must be https://<IPv4>/path (IP literal, no hostname): $BYPASS_DOH_URI"
+    exit 1
+  fi
+  doh_host="${BYPASS_DOH_URI#https://}"; doh_host="${doh_host%%[:/]*}"
+  validate_ipv4 "$doh_host" || { err "Invalid IPv4 in BYPASS_DOH_URI: $doh_host"; exit 1; }
+
+  # 1) группа + членство
+  getent group "$BYPASS_GROUP" >/dev/null 2>&1 || groupadd -r "$BYPASS_GROUP"
+  usermod -aG "$BYPASS_GROUP" "$user"
+  log "Group $BYPASS_GROUP ready; user $user added"
+
+  # 2) список разрешённых DoH-IP
+  write_default_bypass_ips
+  if ! grep -qE "^[[:space:]]*${doh_host//./\\.}([[:space:]]|#|$)" "$BYPASS_IPS_FILE"; then
+    warn "$doh_host is NOT in $BYPASS_IPS_FILE — DoH will be blocked until you add it"
+  fi
+
+  # 3) launcher
+  cat > "$BYPASS_LAUNCHER" <<EOF_LAUNCH
+#!/usr/bin/env bash
+# Generated by wdns. Запускает LibreWolf (flatpak) в группе $BYPASS_GROUP
+# с отдельным профилем и DoH. Остальная система остаётся на whitelist.
+set -euo pipefail
+APP_ID="$BYPASS_APP_ID"
+GROUP="$BYPASS_GROUP"
+PROFILE_DIR="\$HOME/.var/app/\$APP_ID/data/wdns-bypass-profile"
+
+LOG="\${XDG_CACHE_HOME:-\$HOME/.cache}/wdns-bypass.log"
+mkdir -p "\$(dirname "\$LOG")"
+exec >>"\$LOG" 2>&1
+echo "--- \$(date -Is) launch: \$*"
+
+fail() {
+  echo "ERROR: \$*"
+  command -v notify-send >/dev/null 2>&1 && notify-send "wdns bypass" "\$*" || true
+  exit 1
+}
+
+[[ \$EUID -eq 0 ]] && fail "Do not run as root"
+command -v sg >/dev/null 2>&1 || fail "sg not found"
+getent group "\$GROUP" | cut -d: -f4 | tr ',' '\n' | grep -qx "\$(id -un)" \\
+  || fail "user is not in group \$GROUP (run: sudo wdns.sh bypass-setup)"
+[[ -d "\$PROFILE_DIR" ]] || fail "profile dir missing: \$PROFILE_DIR"
+
+CMD="\$(printf '%q ' /usr/bin/flatpak run --command=librewolf --no-documents-portal "\$APP_ID" \\
+  --no-remote --profile "\$PROFILE_DIR" "\$@")"
+echo "exec: \$CMD"
+exec sg "\$GROUP" -c "\$CMD" </dev/null
+EOF_LAUNCH
+  chmod 0755 "$BYPASS_LAUNCHER"
+  chown root:root "$BYPASS_LAUNCHER"
+
+  # 4) отдельный профиль с DoH-only (от имени пользователя)
+  runuser -u "$user" -- mkdir -p -m 0700 "$profile"
+  runuser -u "$user" -- tee "$profile/user.js" >/dev/null <<EOF_USERJS
+// Generated by wdns — DoH-only профиль (TRR mode 3: без отката на системный DNS)
+user_pref("network.trr.mode", 3);
+user_pref("network.trr.uri", "$BYPASS_DOH_URI");
+user_pref("network.trr.custom_uri", "$BYPASS_DOH_URI");
+user_pref("network.trr.default_provider_uri", "$BYPASS_DOH_URI");
+user_pref("network.trr.confirmationNS", "skip");
+user_pref("network.trr.allow-rfc1918", false);
+user_pref("doh-rollout.disable-heuristics", true);
+user_pref("network.dns.disableIPv6", true);
+EOF_USERJS
+
+  # 5) .desktop (намеренно БЕЗ MimeType — не становится браузером по умолчанию)
+  runuser -u "$user" -- mkdir -p "$home/.local/share/applications"
+  runuser -u "$user" -- tee "$home/.local/share/applications/$BYPASS_DESKTOP_NAME" >/dev/null <<EOF_DESKTOP
+[Desktop Entry]
+Type=Application
+Name=LibreWolf (DoH bypass)
+Comment=Isolated profile with DoH, bypasses local DNS whitelist
+Exec=$BYPASS_LAUNCHER %u
+Icon=$BYPASS_APP_ID
+Terminal=false
+StartupNotify=true
+StartupWMClass=librewolf
+X-MultipleArgs=false
+Keywords=Internet;WWW;Browser;Web;Explorer;
+Categories=Network;WebBrowser;
+EOF_DESKTOP
+  runuser -u "$user" -- update-desktop-database "$home/.local/share/applications" >/dev/null 2>&1 || true
+
+  # 6) firewall
+  apply_firewall
+
+  log "Bypass configured. Launch: $BYPASS_LAUNCHER   (or menu: «LibreWolf (DoH bypass)»)"
+  log "Profile: $profile"
+  warn "Проверьте в запущенном браузере: about:networking#dns и about:preferences#privacy"
+  warn "Обычный запуск LibreWolf не затронут и по-прежнему идёт через whitelist."
+}
+
+bypass_remove() {
+  require_root
+  bypass_cleanup_files
+  [[ -f "$STATE_FILE" ]] && apply_firewall || true
+  log "Bypass removed (group, launcher, rule). Profile directory kept — delete manually if desired."
+}
+
 apply_firewall() {
+  write_default_bypass_ips
   write_doh_ip_set
   render_nft_rules
   write_nft_helper_scripts
@@ -792,6 +972,7 @@ restore_defaults() {
       "/etc/systemd/system/$WDNS_NFT_SERVICE" \
       "/etc/systemd/system/$WDNS_ENSURE_SERVICE"
 
+  bypass_cleanup_files
   rm -rf "$WDNS_DIR"
 
   systemctl daemon-reload >/dev/null 2>&1 || true
@@ -870,8 +1051,14 @@ show_status() {
   ss -lntup 2>/dev/null | grep -E ':53\b' || echo "(none)"
   echo
 
+  echo "=== DoH bypass ==="
+  getent group "$BYPASS_GROUP" || echo "group $BYPASS_GROUP absent (bypass disabled)"
+  [[ -f "$BYPASS_IPS_FILE" ]] && grep -vE '^[[:space:]]*(#|$)' "$BYPASS_IPS_FILE" || true
+  nft list chain inet wdns_whitelist output 2>/dev/null | grep -E 'skgid' || echo "(no bypass rule active)"
+  echo
+
   echo "=== nftables rules (summary) ==="
-  nft list table inet wdns_whitelist 2>/dev/null | head -40 || echo "table inet wdns_whitelist absent"
+  nft list table inet wdns_whitelist 2>/dev/null | head -60 || echo "table inet wdns_whitelist absent"
 }
 
 usage() {
@@ -881,6 +1068,8 @@ Usage:
   sudo $0 update               - Update configuration after editing whitelist.txt
   sudo $0 status               - Show current status
   sudo $0 restore              - Restore stock network/DNS settings
+  sudo $0 bypass-setup         - Per-app DoH bypass for LibreWolf (flatpak), isolated profile
+  sudo $0 bypass-remove        - Remove the bypass
 
 Whitelist format (whitelist.txt):
   example.com          # allow
@@ -890,6 +1079,9 @@ Whitelist format (whitelist.txt):
 Everything not listed in the whitelist → REFUSED.
 IPv6 is fully disabled.
 DoH/DoT: domains blocked in dnsmasq, known IPs blocked in nftables.
+
+Bypass (optional): group $BYPASS_GROUP may reach ONLY tcp/443 of IPs listed in
+  $BYPASS_IPS_FILE. Env: BYPASS_APP_ID, BYPASS_DOH_URI (must be https://<IPv4>/...).
 EOF
   exit 1
 }
@@ -899,5 +1091,7 @@ case "${1:-}" in
   update)    update_whitelist ;;
   status)    show_status ;;
   restore)   restore_defaults ;;
+  bypass-setup)  bypass_setup ;;
+  bypass-remove) bypass_remove ;;
   *)         usage ;;
 esac
